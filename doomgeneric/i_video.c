@@ -321,13 +321,18 @@ void I_ShutdownGraphics(void)
     }
 }
 
-// Forward declaration for texture atlas reset
+// Forward declarations for FPGA acceleration
 extern void Reset_Texture_Atlas(void);
+extern void HW_StartFrame(void);
+extern void HW_FinishFrame(void);
 
 void I_StartFrame(void)
 {
     // Reset the texture atlas offset for this frame
     Reset_Texture_Atlas();
+
+    // Start FPGA batch processing for this frame
+    HW_StartFrame();
 
     // IMPORTANT: Do NOT clear I_VideoBuffer every frame!
     // Original DOOM never clears the framebuffer because:
@@ -377,6 +382,9 @@ void I_FinishUpdate(void)
     x_offset = (((s_Fb.xres - (SCREENWIDTH * fb_scaling)) * s_Fb.bits_per_pixel / 8)) / 2; // XXX: siglent FB hack: /4 instead of /2, since it seems to handle the resolution in a funny way
     // x_offset     = 0;
     x_offset_end = ((s_Fb.xres - (SCREENWIDTH * fb_scaling)) * s_Fb.bits_per_pixel / 8) - x_offset;
+
+    // Execute all queued FPGA commands and DMA framebuffer to DDR
+    HW_FinishFrame();
 
     /* DRAW SCREEN */
     line_in = (unsigned char *)I_VideoBuffer;

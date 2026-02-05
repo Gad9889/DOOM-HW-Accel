@@ -1,242 +1,404 @@
+// doom_accel.c - FPGA Accelerator Driver for DOOM (Batch Rendering v2)
 #include "doom_accel.h"
+#include "doomgeneric.h"
 #include <string.h>
 #include <stdio.h>
 
+// ============================================================================
 // GLOBALS
+// ============================================================================
 volatile uint32_t *accel_regs = NULL;
 void *shared_mem_virt = NULL;
 
-// Texture atlas pointer and rolling offset
+// Memory region pointers (virtual addresses)
+uint8_t *I_VideoBuffer_shared = NULL;
+DrawCommand *cmd_buffer_virt = NULL;
 uint8_t *tex_atlas_virt = NULL;
-uint32_t tex_atlas_offset = 0;
-#define TEX_ATLAS_SIZE (16 * 1024 * 1024) // 16MB texture atlas
-
-// Colormap pointer (virtual address)
 uint8_t *colormap_virt = NULL;
 
-// I_VideoBuffer shared pointer (320x200 unified buffer)
-uint8_t *I_VideoBuffer_shared = NULL;
+// Command buffer state
+uint32_t cmd_count = 0;
 
-// DEBUG COUNTER
-int debug_log_count = 0;
-FILE *debug_file = NULL;
+// Texture atlas offset (for level texture uploads)
+uint32_t tex_atlas_offset = 0;
+#define TEX_ATLAS_SIZE (16 * 1024 * 1024) // 16MB
 
-// DEBUG MODE FLAGS
-// Set to 1 to use software rendering (colored columns or textured)
-// Set to 0 to use FPGA (requires synthesized HLS IP deployed on PYNQ)
-int debug_sw_fallback = 0; // Set to 1 until new HLS IP is synthesized
+// Debug flags
+int debug_sw_fallback = 0; // 0 = use FPGA, 1 = software fallback
 
-// Reset texture atlas offset at start of each frame
-void Reset_Texture_Atlas()
+// ============================================================================
+// HELPER: Wait for FPGA idle
+// ============================================================================
+static inline void wait_fpga_idle(void)
 {
-    tex_atlas_offset = 0;
+    int timeout = 100000;
+    while ((accel_regs[REG_CTRL / 4] & 0x4) == 0 && --timeout > 0)
+        ;
+    if (timeout == 0)
+    {
+        printf("WARN: FPGA idle timeout! CTRL=0x%08X\n", accel_regs[REG_CTRL / 4]);
+    }
 }
 
-// Upload a texture column to the atlas and return its offset
-uint32_t Upload_Texture_Column(const uint8_t *source, int height)
+// ============================================================================
+// HELPER: Wait for FPGA done
+// ============================================================================
+static inline void wait_fpga_done(void)
 {
-    if (!tex_atlas_virt || !source || height <= 0)
-        return 0;
-
-    // Check if we have space (wrap around if needed)
-    if (tex_atlas_offset + height > TEX_ATLAS_SIZE)
+    int timeout = 1000000; // Longer timeout for batch processing
+    while ((accel_regs[REG_CTRL / 4] & 0x2) == 0 && --timeout > 0)
+        ;
+    if (timeout == 0)
     {
-        tex_atlas_offset = 0; // Wrap around
+        printf("ERR: FPGA done timeout! CTRL=0x%08X\n", accel_regs[REG_CTRL / 4]);
+    }
+}
+
+// ============================================================================
+// HELPER: Fire FPGA with mode
+// ============================================================================
+static void fire_fpga(uint32_t mode, uint32_t num_commands)
+{
+    // Ensure FPGA is idle
+    wait_fpga_idle();
+
+    // Set mode and command count
+    accel_regs[REG_MODE / 4] = mode;
+    accel_regs[REG_NUM_COMMANDS / 4] = num_commands;
+
+    // Memory barrier
+    __sync_synchronize();
+
+    // Fire: Set ap_start
+    accel_regs[REG_CTRL / 4] = 0x1;
+
+    // Wait for completion
+    wait_fpga_done();
+}
+
+// ============================================================================
+// Init_Doom_Accel - Initialize hardware acceleration
+// ============================================================================
+void Init_Doom_Accel(void)
+{
+    printf("=== DOOM FPGA Accelerator v2 (Batch Mode) ===\n");
+
+    int fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (fd < 0)
+    {
+        printf("ERR: Can't open /dev/mem - running without FPGA\n");
+        debug_sw_fallback = 1;
+        return;
     }
 
-    uint32_t offset = tex_atlas_offset;
+    // 1. Map Registers
+    accel_regs = (volatile uint32_t *)mmap(NULL, ACCEL_SIZE,
+                                           PROT_READ | PROT_WRITE,
+                                           MAP_SHARED, fd, ACCEL_BASE_ADDR);
+    if (accel_regs == MAP_FAILED)
+    {
+        printf("ERR: Reg mmap failed - running without FPGA\n");
+        debug_sw_fallback = 1;
+        close(fd);
+        return;
+    }
 
-    // Copy the texture column data
-    memcpy(tex_atlas_virt + offset, source, height);
+    // 2. Map DDR (entire shared memory region)
+    shared_mem_virt = mmap(NULL, MEM_BLOCK_SIZE,
+                           PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd, PHY_FB_ADDR);
+    if (shared_mem_virt == MAP_FAILED)
+    {
+        printf("ERR: DDR mmap failed - running without FPGA\n");
+        debug_sw_fallback = 1;
+        munmap((void *)accel_regs, ACCEL_SIZE);
+        accel_regs = NULL;
+        close(fd);
+        return;
+    }
 
-    // Advance the offset
-    tex_atlas_offset += height;
+    // Setup pointers based on memory layout:
+    // 0x70000000: DG_ScreenBuffer (1920x1080x4 = 8MB)
+    // 0x70800000: I_VideoBuffer output (320x200 = 64KB)
+    // 0x70810000: Command Buffer (64KB)
+    // 0x70820000: Texture Atlas (16MB)
+    // 0x71820000: Colormap (8KB)
 
-    return offset;
+    DG_ScreenBuffer = (uint32_t *)shared_mem_virt;
+    I_VideoBuffer_shared = (uint8_t *)shared_mem_virt + (PHY_VIDEO_BUF - PHY_FB_ADDR);
+    cmd_buffer_virt = (DrawCommand *)((uint8_t *)shared_mem_virt + (PHY_CMD_BUF - PHY_FB_ADDR));
+    tex_atlas_virt = (uint8_t *)shared_mem_virt + (PHY_TEX_ADDR - PHY_FB_ADDR);
+    colormap_virt = (uint8_t *)shared_mem_virt + (PHY_CMAP_ADDR - PHY_FB_ADDR);
+
+    // CRITICAL: Set I_VideoBuffer to shared DDR so CPU rendering goes there too
+    extern uint8_t *I_VideoBuffer;
+    I_VideoBuffer = I_VideoBuffer_shared;
+
+    printf("Memory Layout:\n");
+    printf("  DG_ScreenBuffer: %p (phys 0x%08X)\n", DG_ScreenBuffer, PHY_FB_ADDR);
+    printf("  I_VideoBuffer:   %p (phys 0x%08X)\n", I_VideoBuffer_shared, PHY_VIDEO_BUF);
+    printf("  Command Buffer:  %p (phys 0x%08X)\n", cmd_buffer_virt, PHY_CMD_BUF);
+    printf("  Texture Atlas:   %p (phys 0x%08X)\n", tex_atlas_virt, PHY_TEX_ADDR);
+    printf("  Colormap:        %p (phys 0x%08X)\n", colormap_virt, PHY_CMAP_ADDR);
+
+    // Clear buffers
+    memset(DG_ScreenBuffer, 0, 1920 * 1080 * 4);
+    memset(I_VideoBuffer_shared, 0, 320 * 200);
+    memset(cmd_buffer_virt, 0, CMD_BUF_SIZE);
+
+    // Setup FPGA pointer addresses (tell AXI masters where memory is)
+    accel_regs[REG_FB_OUT_LO / 4] = PHY_VIDEO_BUF;
+    accel_regs[REG_FB_OUT_HI / 4] = 0;
+    accel_regs[REG_TEX_ATLAS_LO / 4] = PHY_TEX_ADDR;
+    accel_regs[REG_TEX_ATLAS_HI / 4] = 0;
+    accel_regs[REG_CMAP_DDR_LO / 4] = PHY_CMAP_ADDR;
+    accel_regs[REG_CMAP_DDR_HI / 4] = 0;
+    accel_regs[REG_CMD_BUF_LO / 4] = PHY_CMD_BUF;
+    accel_regs[REG_CMD_BUF_HI / 4] = 0;
+
+    // Verify FPGA is responding
+    uint32_t ctrl_reg = accel_regs[REG_CTRL / 4];
+    printf("FPGA CTRL register = 0x%08X (expect ap_idle=0x4)\n", ctrl_reg);
+
+    if ((ctrl_reg & 0x4) == 0)
+    {
+        printf("WARNING: FPGA not idle - may not be programmed!\n");
+    }
+
+    cmd_count = 0;
+    tex_atlas_offset = 0;
+
+    printf("=== ACCEL INIT COMPLETE ===\n");
 }
 
-// Upload the colormap table to shared DDR for FPGA access
-// DOOM has 32 light levels, each with 256 palette mappings = 8KB total
+// ============================================================================
+// Upload_Colormap - Copy colormap to DDR and load into FPGA BRAM
+// ============================================================================
 void Upload_Colormap(const uint8_t *colormaps_ptr, int size)
 {
     if (!colormap_virt || !colormaps_ptr || size <= 0)
     {
-        printf("ERR: Cannot upload colormap - pointers not initialized\n");
+        printf("ERR: Cannot upload colormap - invalid pointers\n");
         return;
     }
 
     // Copy colormap to DDR
     memcpy(colormap_virt, colormaps_ptr, size);
-    printf("DEBUG: Uploaded %d bytes of colormap to DDR\n", size);
+    printf("Uploaded %d bytes of colormap to DDR\n", size);
+
+    // If FPGA available, trigger load into BRAM
+    if (accel_regs && !debug_sw_fallback)
+    {
+        fire_fpga(MODE_LOAD_COLORMAP, 0);
+        printf("Colormap loaded into FPGA BRAM\n");
+    }
 }
 
-void Init_Doom_Accel()
+// ============================================================================
+// Upload_Texture_Data - Copy texture data to atlas, return offset
+// ============================================================================
+uint32_t Upload_Texture_Data(const uint8_t *source, int size)
 {
-    int fd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (fd < 0)
+    if (!tex_atlas_virt || !source || size <= 0)
+        return 0;
+
+    // Check space (wrap if needed - shouldn't happen within a level)
+    if (tex_atlas_offset + size > TEX_ATLAS_SIZE)
     {
-        printf("ERR: Can't open /dev/mem\n");
-        exit(1);
+        printf("WARN: Texture atlas overflow, wrapping\n");
+        tex_atlas_offset = 0;
     }
 
-    // 1. Map Registers
-    accel_regs = (volatile uint32_t *)mmap(NULL, ACCEL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, ACCEL_BASE_ADDR);
-    if (accel_regs == MAP_FAILED)
-    {
-        printf("ERR: Reg mmap failed\n");
-        exit(1);
-    }
+    uint32_t offset = tex_atlas_offset;
+    memcpy(tex_atlas_virt + offset, source, size);
+    tex_atlas_offset += size;
 
-    // 2. Map DDR (entire shared memory region)
-    shared_mem_virt = mmap(NULL, MEM_BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, PHY_FB_ADDR);
-    if (shared_mem_virt == MAP_FAILED)
-    {
-        printf("ERR: DDR mmap failed\n");
-        exit(1);
-    }
+    return offset;
+}
 
-    // Setup pointers based on memory layout:
-    // 0x70000000: DG_ScreenBuffer (1920x1080x4 = 8MB)
-    // 0x70800000: I_VideoBuffer (320x200 = 64KB)
-    // 0x70810000: Texture Atlas (16MB)
-    // 0x71810000: Colormap (8KB)
-
-    DG_ScreenBuffer = (uint32_t *)shared_mem_virt;
-    I_VideoBuffer_shared = (uint8_t *)shared_mem_virt + 0x00800000; // +8MB
-    tex_atlas_virt = (uint8_t *)shared_mem_virt + 0x00810000;       // +8MB+64KB
-    colormap_virt = (uint8_t *)shared_mem_virt + 0x01810000;        // +24MB+64KB
+// ============================================================================
+// Reset_Texture_Atlas - Reset for new level
+// ============================================================================
+void Reset_Texture_Atlas(void)
+{
     tex_atlas_offset = 0;
-
-    // CRITICAL: Set I_VideoBuffer to shared DDR so all rendering goes to same buffer
-    extern uint8_t *I_VideoBuffer;
-    I_VideoBuffer = I_VideoBuffer_shared;
-    printf("DEBUG: I_VideoBuffer set to shared DDR at %p\n", I_VideoBuffer);
-
-    // Clear framebuffer to black
-    memset(DG_ScreenBuffer, 0, 1920 * 1080 * 4);
-
-    // Clear I_VideoBuffer (320x200)
-    memset(I_VideoBuffer_shared, 0, 320 * 200);
-
-    // Setup FPGA Pointer Addresses (set once at init)
-    // These tell the AXI masters where to read/write in DDR
-    accel_regs[REG_VIDEO_BUF_LO / 4] = PHY_VIDEO_BUF;
-    accel_regs[REG_VIDEO_BUF_HI / 4] = 0;
-    accel_regs[REG_TEX_ATLAS_LO / 4] = PHY_TEX_ADDR;
-    accel_regs[REG_TEX_ATLAS_HI / 4] = 0;
-    accel_regs[REG_COLORMAP_LO / 4] = PHY_CMAP_ADDR;
-    accel_regs[REG_COLORMAP_HI / 4] = 0;
-    
-    printf("DEBUG: FPGA pointers set - VIDEO=0x%08X TEX=0x%08X CMAP=0x%08X\n",
-           PHY_VIDEO_BUF, PHY_TEX_ADDR, PHY_CMAP_ADDR);
-
-    // Verify FPGA is responding by reading control register
-    uint32_t ctrl_reg = accel_regs[REG_CTRL / 4];
-    printf("DEBUG: FPGA CTRL register = 0x%08X (expect ap_idle=0x4)\n", ctrl_reg);
-    if ((ctrl_reg & 0x4) == 0) {
-        printf("WARNING: FPGA ap_idle not set - IP may not be ready!\n");
-    }
-
-    // Clear texture atlas
-    printf("DEBUG: Clearing texture atlas...\n");
-    memset(tex_atlas_virt, 0, TEX_ATLAS_SIZE);
-    printf("DEBUG: Texture atlas ready.\n");
-
-    // Open Debug Log
-    debug_file = fopen("debug_draw.log", "w");
-    if (debug_file)
-        fprintf(debug_file, "--- DOOM ACCEL DEBUG LOG ---\n");
-
-    printf("--- ACCEL INIT COMPLETE ---\n");
 }
 
-void HW_DrawColumn(int x, int y_start, int y_end, int step, int frac, int tex_offset, int colormap_offset)
+// ============================================================================
+// HW_StartFrame - Begin a new frame (reset command buffer)
+// ============================================================================
+void HW_StartFrame(void)
 {
-    if (!accel_regs)
+    cmd_count = 0;
+    // NOTE: We do NOT clear framebuffer BRAM here!
+    // HUD elements persist across frames. Only call HW_ClearFramebuffer()
+    // at level transitions or when explicitly needed.
+}
+
+// ============================================================================
+// HW_QueueColumn - Queue a column draw command (walls)
+// ============================================================================
+void HW_QueueColumn(int x, int y_start, int y_end, uint32_t frac, uint32_t step,
+                    uint32_t tex_offset, int light_level)
+{
+    // Safety clamp
+    if (x < 0 || x >= 320)
         return;
-
-    // UNIFIED BUFFER: FPGA writes to 320x200 I_VideoBuffer (8-bit palette indexed)
-    // No scaling here - CPU handles scaling in I_FinishUpdate()
-
-    // Safety Clamping (for unscaled coords)
     if (y_start < 0)
         y_start = 0;
     if (y_end >= 200)
         y_end = 199;
-    if (x < 0 || x >= 320)
-        return;
     if (y_start > y_end)
         return;
 
-    // DEBUG LOGGING (First 50 calls only)
-    if (debug_file && debug_log_count < 50)
+    // Check buffer capacity
+    if (cmd_count >= MAX_COMMANDS)
     {
-        // Log FPGA control register state before command
-        uint32_t ctrl_before = accel_regs[REG_CTRL / 4];
-        fprintf(debug_file, "CTRL=0x%02X X=%d Y=%d-%d step=%d frac=%d tex=%d cmap=%d\n",
-                ctrl_before, x, y_start, y_end, step, frac, tex_offset, colormap_offset);
-        debug_log_count++;
-        if (debug_log_count == 50)
-        {
-            fprintf(debug_file, "--- LOG STOPPED ---\n");
-            fclose(debug_file);
-            debug_file = NULL;
-        }
+        // Buffer full - flush and continue
+        printf("WARN: Command buffer full, flushing mid-frame\n");
+        HW_FinishFrame();
+        cmd_count = 0;
     }
 
-    // =========================================================
-    // DEBUG SOFTWARE FALLBACK MODE
-    // Set debug_sw_fallback=1 to draw colored columns via CPU
-    // =========================================================
-    if (debug_sw_fallback)
+    // Software fallback mode: draw directly
+    if (debug_sw_fallback || !accel_regs)
     {
-        // Draw columns directly to I_VideoBuffer (320x200, 8-bit palette)
+        // CPU software rendering
         uint8_t *vbuf = I_VideoBuffer_shared;
         if (!vbuf)
             return;
 
-        // Use a distinguishable palette index based on x position
+        // Simple colored column for debug
         uint8_t color = (uint8_t)((x * 7) & 0xFF);
-
         for (int y = y_start; y <= y_end; y++)
         {
             vbuf[y * 320 + x] = color;
         }
         return;
     }
-    // =========================================================
 
-    // Send commands to FPGA for unified 320x200 buffer rendering
+    // Queue command for FPGA batch processing
+    DrawCommand *cmd = &cmd_buffer_virt[cmd_count];
+    cmd->cmd_type = CMD_TYPE_COLUMN;
+    cmd->cmap_index = (uint8_t)(light_level & 31); // Clamp to 32 levels
+    cmd->x1 = (uint16_t)x;
+    cmd->x2 = 0; // unused for column
+    cmd->y1 = (uint16_t)y_start;
+    cmd->y2 = (uint16_t)y_end;
+    cmd->reserved1 = 0;
+    cmd->frac = frac;
+    cmd->step = step;
+    cmd->tex_offset = tex_offset;
+    cmd->reserved2 = 0;
+    cmd->reserved3 = 0;
 
-    // Command 1: [step(32) | frac(32)]
-    accel_regs[REG_CMD1_LO / 4] = (uint32_t)frac;
-    accel_regs[REG_CMD1_HI / 4] = (uint32_t)step;
+    cmd_count++;
+}
 
-    // Command 2: [y_end(16) | y_start(16) | x(16) | 0(16)]
-    uint64_t cmd2 = ((uint64_t)y_end << 48) |
-                    ((uint64_t)y_start << 32) |
-                    ((uint64_t)x << 16);
-    accel_regs[REG_CMD2_LO / 4] = (uint32_t)(cmd2 & 0xFFFFFFFF);
-    accel_regs[REG_CMD2_HI / 4] = (uint32_t)(cmd2 >> 32);
+// ============================================================================
+// HW_QueueSpan - Queue a span draw command (floors/ceilings)
+// ============================================================================
+void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
+                  uint32_t tex_offset, int light_level)
+{
+    // Safety clamp
+    if (y < 0 || y >= 200)
+        return;
+    if (x1 < 0)
+        x1 = 0;
+    if (x2 >= 320)
+        x2 = 319;
+    if (x1 > x2)
+        return;
 
-    // Command 3: [colormap_offset(32) | tex_offset(32)]
-    uint64_t cmd3 = ((uint64_t)colormap_offset << 32) | (uint32_t)tex_offset;
-    accel_regs[REG_CMD3_LO / 4] = (uint32_t)(cmd3 & 0xFFFFFFFF);
-    accel_regs[REG_CMD3_HI / 4] = (uint32_t)(cmd3 >> 32);
+    // Check buffer capacity
+    if (cmd_count >= MAX_COMMANDS)
+    {
+        printf("WARN: Command buffer full, flushing mid-frame\n");
+        HW_FinishFrame();
+        cmd_count = 0;
+    }
 
-    // Memory barrier to ensure all writes are visible before starting FPGA
+    // Software fallback mode: draw directly
+    if (debug_sw_fallback || !accel_regs)
+    {
+        uint8_t *vbuf = I_VideoBuffer_shared;
+        if (!vbuf)
+            return;
+
+        // Simple colored span for debug
+        uint8_t color = (uint8_t)((y * 3) & 0xFF);
+        for (int x = x1; x <= x2; x++)
+        {
+            vbuf[y * 320 + x] = color;
+        }
+        return;
+    }
+
+    // Queue command for FPGA batch processing
+    DrawCommand *cmd = &cmd_buffer_virt[cmd_count];
+    cmd->cmd_type = CMD_TYPE_SPAN;
+    cmd->cmap_index = (uint8_t)(light_level & 31);
+    cmd->x1 = (uint16_t)x1;
+    cmd->x2 = (uint16_t)x2;
+    cmd->y1 = (uint16_t)y;
+    cmd->y2 = 0; // unused for span
+    cmd->reserved1 = 0;
+    cmd->frac = position; // Packed texture position
+    cmd->step = step;     // Packed texture step
+    cmd->tex_offset = tex_offset;
+    cmd->reserved2 = 0;
+    cmd->reserved3 = 0;
+
+    cmd_count++;
+}
+
+// ============================================================================
+// HW_FinishFrame - Execute all queued commands and DMA to DDR
+// ============================================================================
+void HW_FinishFrame(void)
+{
+    if (debug_sw_fallback || !accel_regs)
+    {
+        // Software mode - already rendered during HW_QueueColumn
+        return;
+    }
+
+    if (cmd_count == 0)
+    {
+        // No commands to process, but still need to DMA framebuffer out
+        // (for HUD-only frames)
+        fire_fpga(MODE_DMA_OUT, 0);
+        return;
+    }
+
+    // Memory barrier to ensure all commands are written to DDR
     __sync_synchronize();
 
-    // Fire: Set ap_start bit (bit 0)
-    accel_regs[REG_CTRL / 4] = 0x1;
-    
-    // Wait for ap_done (bit 1) 
-    // Timeout after ~1000 iterations to avoid infinite loop
-    int timeout = 10000;
-    while ((accel_regs[REG_CTRL / 4] & 0x2) == 0 && --timeout > 0)
-        ;
-    
-    if (timeout == 0 && debug_log_count < 5) {
-        printf("FPGA TIMEOUT! CTRL=0x%08X\n", accel_regs[REG_CTRL / 4]);
+    // Process batch
+    fire_fpga(MODE_DRAW_BATCH, cmd_count);
+
+    // DMA framebuffer BRAM to DDR
+    fire_fpga(MODE_DMA_OUT, 0);
+
+    // Reset for next frame
+    cmd_count = 0;
+}
+
+// ============================================================================
+// HW_ClearFramebuffer - Clear FPGA framebuffer BRAM (level transitions)
+// ============================================================================
+void HW_ClearFramebuffer(void)
+{
+    if (debug_sw_fallback || !accel_regs)
+    {
+        // Software: clear DDR buffer directly
+        if (I_VideoBuffer_shared)
+        {
+            memset(I_VideoBuffer_shared, 0, 320 * 200);
+        }
+        return;
     }
+
+    fire_fpga(MODE_CLEAR_FB, 0);
 }

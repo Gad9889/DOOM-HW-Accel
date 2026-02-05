@@ -143,19 +143,24 @@ void R_DrawColumn(void)
     // This ensures correct z-ordering. Scaling happens in I_FinishUpdate.
     // ---------------------------------------------------------
 
-    // FPGA ACCELERATION: Dispatch wall columns to hardware
+    // FPGA ACCELERATION: Queue wall columns for batch processing
     // Sprites and other content use software for correct z-ordering
     if (drawing_wall && accel_regs && !debug_sw_fallback)
     {
-        // Upload texture column to atlas
-        uint32_t tex_offset = Upload_Texture_Column(dc_source, 128);
+        // Get texture offset in atlas (texture should already be uploaded at level load)
+        // For now, upload per-column (TODO: pre-upload all level textures)
+        extern uint32_t Upload_Texture_Data(const uint8_t *source, int size);
+        uint32_t tex_offset = Upload_Texture_Data(dc_source, 128);
 
-        // Calculate colormap offset (dc_colormap points into colormaps array)
+        // Calculate light level (dc_colormap points into colormaps array)
+        // Each light level is 256 bytes, so light_level = offset / 256
         extern byte *colormaps; // Base of all colormaps
-        int colormap_offset = (int)(dc_colormap - colormaps);
+        int light_level = (int)(dc_colormap - colormaps) / 256;
 
-        // Send to FPGA
-        HW_DrawColumn(dc_x, dc_yl, dc_yh, fracstep, frac, tex_offset, colormap_offset);
+        // Queue for FPGA batch processing (executed at I_FinishUpdate)
+        extern void HW_QueueColumn(int x, int y_start, int y_end, uint32_t frac, uint32_t step,
+                                   uint32_t tex_offset, int light_level);
+        HW_QueueColumn(dc_x, dc_yl, dc_yh, frac, fracstep, tex_offset, light_level);
         return;
     }
 
@@ -611,14 +616,35 @@ void R_DrawSpan(void)
     position = ((ds_xfrac << 10) & 0xffff0000) | ((ds_yfrac >> 6) & 0x0000ffff);
     step = ((ds_xstep << 10) & 0xffff0000) | ((ds_ystep >> 6) & 0x0000ffff);
 
-    dest = ylookup[ds_y] + columnofs[ds_x1];
-
-    // We do not check for zero spans here?
-    count = ds_x2 - ds_x1;
-
     // Profiling
     perf_drawspan_count++;
-    perf_drawspan_pixels += count;
+    perf_drawspan_pixels += (ds_x2 - ds_x1);
+
+    // ---------------------------------------------------------
+    // FPGA ACCELERATION: Queue span for batch processing
+    // ---------------------------------------------------------
+    if (accel_regs && !debug_sw_fallback)
+    {
+        // Upload flat texture to atlas (64x64 = 4096 bytes)
+        extern uint32_t Upload_Texture_Data(const uint8_t *source, int size);
+        uint32_t tex_offset = Upload_Texture_Data(ds_source, 4096);
+
+        // Calculate light level from colormap
+        extern byte *colormaps;
+        int light_level = (int)(ds_colormap - colormaps) / 256;
+
+        // Queue for FPGA batch processing
+        extern void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
+                                 uint32_t tex_offset, int light_level);
+        HW_QueueSpan(ds_y, ds_x1, ds_x2, position, step, tex_offset, light_level);
+        return;
+    }
+
+    // ---------------------------------------------------------
+    // SOFTWARE PATH: Fallback when FPGA not available
+    // ---------------------------------------------------------
+    dest = ylookup[ds_y] + columnofs[ds_x1];
+    count = ds_x2 - ds_x1;
 
     do
     {

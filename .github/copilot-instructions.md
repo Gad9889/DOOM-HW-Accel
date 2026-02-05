@@ -1,166 +1,128 @@
 # DOOM FPGA Acceleration Project - Copilot Memory
 
+## ⚠️ IMPORTANT RULES FOR COPILOT ⚠️
+
+1. **DO NOT make major architecture changes without user confirmation**
+2. **DO NOT remove the BRAM framebuffer** - it provides critical performance gains
+3. **DO NOT upload unverified code to git** - wait until it works
+4. **Ask before changing core design decisions** like buffer locations, BRAM usage, etc.
+
 ## Project Overview
 
 FPGA-accelerated DOOM running on PYNQ board (Avnet Ultra96-V2 / aup-zu3).
 
-### Architecture (Unified Buffer Approach)
+### Architecture (Batch Rendering v2)
 
 - **PS (Processing System)**: ARM CPU running Linux, handles:
   - Game logic, BSP traversal
-  - ALL rendering to shared 320x200 I_VideoBuffer
+  - Sprites, floors/ceilings, HUD rendered via software to I_VideoBuffer
+  - Queues wall column commands for FPGA batch processing
   - Scaling 320x200 → 1920x1080 in I_FinishUpdate()
   - Runs doomgeneric C engine
+
 - **PL (Programmable Logic)**: FPGA with custom HLS IP core:
-  - Writes wall columns to shared 320x200 buffer (same as CPU)
-  - Can use BRAM (64KB fits in 9.8Mb) for faster access
-  - Reads textures from DDR texture atlas
-- **Memory**: Shared physical DDR region
-  - I_VideoBuffer: `0x70000000` (320x200x1 = 64KB, 8-bit palette indexed)
-  - Texture Atlas: `0x70010000` (16MB region)
-  - Colormap: `0x70020000` (256 bytes per light level)
-  - DG_ScreenBuffer: `0x71000000` (1920x1080x4 = 8MB, 32-bit RGBA output)
-  - CPU maps via `/dev/mem`, FPGA uses AXI master
+  - **Colormap in BRAM** (8KB) - loaded once at level start, never reloaded
+  - **Framebuffer in BRAM** (64KB) - 320x200 buffer, persists across frames
+  - **Batch processing** - receives all column commands at once, single handshake
+  - Reads textures from DDR via AXI Master (burst reads)
+  - DMAs framebuffer BRAM → DDR at frame end
+
+- **Memory Layout** (Physical DDR):
+
+  ```
+  0x70000000: DG_ScreenBuffer (1920x1080x4 = 8MB, 32-bit RGBA output)
+  0x70800000: I_VideoBuffer output (320x200 = 64KB, FPGA DMAs here)
+  0x70810000: Command Buffer (64KB, ~2000 draw commands per frame)
+  0x70820000: Texture Atlas (16MB, level textures pre-loaded)
+  0x71820000: Colormap (8KB = 32 light levels × 256 palette entries)
+  ```
 
 - **Display**: Python TCP viewer on PC connects to port 5000
 
-### Why Unified Buffer?
+### Performance Design
 
-Previous approach (FPGA writes 1920x1080, CPU writes 320x200, composite) was broken:
+Previous approach was 2x SLOWER than software (20 FPS vs 50 FPS) due to:
 
-- Z-ordering issues (walls over sprites, HUD broken)
-- Transparency hack failed because black (palette 0) is a valid color
-- No clean way to composite FPGA and CPU rendered content
+- Per-column handshaking (8 register writes + poll per column)
+- Texture upload per column (128 bytes memcpy × 320 columns = 40KB/frame)
+- Colormap reload per column (256 bytes × 320 = 80KB/frame)
 
-New approach:
+New batch approach:
 
-- FPGA and CPU both write to same 320x200 8-bit buffer
-- DOOM's natural BSP/rendering order ensures correct z-ordering
-- CPU scales 320x200 → 1920x1080 at frame end (can move to FPGA later)
-- 64KB buffer fits in FPGA BRAM for fast single-cycle writes
+- **Single handshake per frame** instead of 320 handshakes
+- **Colormap in BRAM permanently** - load once at level start
+- **Framebuffer in BRAM** - 64KB fits easily in 9.8Mb FPGA BRAM
+- **Batch command buffer** - CPU queues all commands, FPGA processes in one shot
+- **Texture burst reads** - FPGA reads 128-byte texture columns via AXI
 
 ## Key Files
 
-### doom_accel.c / doom_accel.h
+### doom_accel.h
 
-- `Init_Doom_Accel()`: Maps registers and DDR, sets `I_VideoBuffer` to shared DDR region
-- `HW_DrawColumn(x, y_start, y_end, step, frac, tex_offset, colormap_offset)`: Sends draw command to FPGA
-- `Upload_Texture_Column(source, height)`: Copies texture data to atlas, returns offset
-- `Upload_Colormap(colormaps_ptr, size)`: Uploads colormap table to DDR (called once at init)
-- `Reset_Texture_Atlas()`: Called at frame start to reset atlas offset
-- Debug flag: `debug_sw_fallback` (1=software rendering, 0=FPGA) - set to 1 until HLS IP synthesized
+- Memory map defines (PHY_FB_ADDR, PHY_VIDEO_BUF, PHY_CMD_BUF, PHY_TEX_ADDR, PHY_CMAP_ADDR)
+- `DrawCommand` structure (32 bytes: x, y_start, y_end, cmap_index, frac, step, tex_offset)
+- Mode defines: MODE_LOAD_COLORMAP, MODE_CLEAR_FB, MODE_DRAW_BATCH, MODE_DMA_OUT
+- Register offsets (update from Vitis HLS synthesis output!)
+
+### doom_accel.c
+
+- `Init_Doom_Accel()`: Maps registers and DDR, sets up pointers
+- `Upload_Colormap()`: Copies colormap to DDR, triggers FPGA BRAM load
+- `Upload_Texture_Data()`: Copies texture to atlas, returns offset
+- `HW_StartFrame()`: Resets command buffer (called from I_StartFrame)
+- `HW_QueueColumn()`: Queues draw command (called from R_DrawColumn for walls)
+- `HW_FinishFrame()`: Fires FPGA to process batch + DMA out (called from I_FinishUpdate)
+- `HW_ClearFramebuffer()`: Clears FPGA BRAM (call at level transitions, not every frame!)
+- Debug flag: `debug_sw_fallback` (1=software rendering, 0=FPGA)
 
 ### i_video.c
 
-- `I_InitGraphics()`: Skips I_VideoBuffer allocation if already set by `Init_Doom_Accel()`
-- `I_StartFrame()`: Resets texture atlas (NO framebuffer clear - HUD persists!)
-- `I_FinishUpdate()`: Uses `cmap_to_fb()` to scale 320x200 → 1920x1080
-- No transparency/compositing needed - all content in same buffer
+- `I_InitGraphics()`: Skips I_VideoBuffer allocation if already set
+- `I_StartFrame()`: Calls `Reset_Texture_Atlas()` and `HW_StartFrame()`
+- `I_FinishUpdate()`: Calls `HW_FinishFrame()` then scales 320x200 → 1920x1080
+- No framebuffer clear every frame (HUD persists!)
 
 ### r_draw.c
 
-- `R_DrawColumn()`: Renders columns to I_VideoBuffer (320x200)
-- When `drawing_wall=1` and FPGA available: dispatches to `HW_DrawColumn()`
-- When `drawing_wall=0` (sprites) or no FPGA: uses software rendering
+- `R_DrawColumn()`: When `drawing_wall=1` and FPGA available, calls `HW_QueueColumn()`
+- Sprites and software fallback use normal software path
 - `drawing_wall` flag set in r_segs.c around `R_RenderSegLoop()`
 
-### r_data.c
+### hls/doom_accel_v2.cpp
 
-- `R_InitColormaps()`: Loads colormap from WAD
-- After loading, calls `Upload_Colormap()` to copy to DDR for FPGA access
+- Vitis HLS IP with unified CTRL AXI-Lite bundle
+- Static BRAM arrays for colormap (8KB) and framebuffer (64KB)
+- Modes:
+  - MODE_LOAD_COLORMAP: DMA colormap DDR → BRAM (once per level)
+  - MODE_CLEAR_FB: Clear framebuffer BRAM
+  - MODE_DRAW_BATCH: Process N commands, prefetch texture per column
+  - MODE_DMA_OUT: DMA framebuffer BRAM → DDR
 
-### hls/doom_accel_320x200.cpp
+## DOOM Rendering Order
 
-- NEW HLS IP that writes to 320x200 buffer instead of 1920x1080
-- Writes 8-bit palette indices (not scaled RGBA)
-- Applies colormap for lighting (like dc_colormap[dc_source[...]])
-- Optional BRAM version for maximum performance
+1. Walls - BSP traversal, front-to-back → **FPGA via HW_QueueColumn()**
+2. Floors/Ceilings - Visplanes (R_DrawSpan) → Software to I_VideoBuffer
+3. Sprites - Sorted by distance → Software to I_VideoBuffer
+4. HUD - Status bar, messages (V_DrawPatch) → Software to I_VideoBuffer
 
-### doomgeneric.c
-
-- Modified to NOT allocate `DG_ScreenBuffer` if already set by hardware init
-
-## Memory Layout (NEW)
-
-```
-Physical Address    Size        Content
------------------------------------------------------------------
-0x70000000         8MB         DG_ScreenBuffer (1920x1080x4, 32-bit RGBA output)
-0x70800000         64KB        I_VideoBuffer (320x200, 8-bit palette indexed)
-0x70810000         16MB        Texture Atlas (uploaded per-frame)
-0x71810000         8KB         Colormaps (32 light levels x 256 bytes)
-0xA0000000         4KB         FPGA Register Interface
-```
-
-## HLS IP (doom_accel_320x200) - NEW DESIGN
-
-Writes to 320x200 buffer (no scaling - CPU handles that):
-
-```cpp
-void doom_accel_320x200(
-    volatile uint8_t* video_buffer,    // 320x200 8-bit buffer
-    volatile uint8_t* texture_atlas,   // Texture data
-    volatile uint8_t* colormap,        // Lighting colormap
-    uint64_t cmd1,                     // [step(32) | frac(32)]
-    uint64_t cmd2,                     // [y_end(16) | y_start(16) | x(16) | 0]
-    uint64_t cmd3                      // [colormap_offset(32) | tex_offset(32)]
-) {
-    // Unpack commands
-    uint32_t frac = cmd1 & 0xFFFFFFFF;
-    uint32_t step = (cmd1 >> 32);
-    uint16_t x = (cmd2 >> 16) & 0xFFFF;
-    uint16_t y_start = (cmd2 >> 32) & 0xFFFF;
-    uint16_t y_end = (cmd2 >> 48) & 0xFFFF;
-    uint32_t tex_offset = cmd3 & 0xFFFFFFFF;
-    uint32_t cmap_offset = (cmd3 >> 32);
-
-    // Draw column to 320x200 buffer
-    for (uint16_t y = y_start; y <= y_end; y++) {
-        uint8_t tex_pixel = texture_atlas[tex_offset + ((frac >> 16) & 127)];
-        uint8_t lit_pixel = colormap[cmap_offset + tex_pixel];
-        video_buffer[y * 320 + x] = lit_pixel;
-        frac += step;
-    }
-}
-```
-
-## BRAM Version (Optional)
-
-For maximum performance, use FPGA BRAM for the 320x200 buffer:
-
-- 64KB easily fits in 9.8Mb BRAM
-- Single-cycle writes vs DDR latency
-- DMA to DDR at frame end
-- Commands: 0=draw_column, 1=clear, 2=dma_out
-
-## Doom Rendering Order
-
-1. Walls - BSP traversal, front-to-back (FPGA accelerated)
-2. Floors/Ceilings - Visplanes (R_DrawSpan)
-3. Sprites - Sorted by distance (R_DrawColumn with drawing_wall=0)
-4. HUD - Status bar, messages (V_DrawPatch)
-
-All rendered to same 320x200 I_VideoBuffer → correct z-ordering automatic.
+All rendered to same 320x200 buffer → correct z-ordering automatic.
 
 ## Current Status
 
 ### Working ✅
 
-- Correct software rendering (baseline working)
-- HUD rendering fixed (removed erroneous framebuffer clear)
-- I_VideoBuffer points to shared DDR (unified buffer)
-- Texture upload system
-- Colormap upload to DDR
-- TCP viewer display
-- Memory mapping
-- FPGA wall dispatch code ready (disabled via debug_sw_fallback=1)
+- Batch rendering architecture designed
+- Command buffer structure defined
+- HLS IP v2 with BRAM colormap and framebuffer
+- Driver with HW_StartFrame/HW_QueueColumn/HW_FinishFrame API
 
 ### TODO 🔧
 
-1. Synthesize new doom_accel_320x200 HLS IP (hls/doom_accel_320x200.cpp)
-2. Set debug_sw_fallback=0 after FPGA IP is deployed
-3. Optional: Move scaling to FPGA for full acceleration
-4. Optional: Use BRAM for I_VideoBuffer for max performance
+1. Synthesize doom_accel_v2.cpp in Vitis HLS
+2. Update register offsets in doom_accel.h from synthesis report
+3. Deploy bitstream to PYNQ
+4. Set debug_sw_fallback=0 to test
+5. Pre-load level textures at level start (currently still per-column upload)
 
 ## Build & Run
 
@@ -168,4 +130,15 @@ All rendered to same 320x200 I_VideoBuffer → correct z-ordering automatic.
 cd doomgeneric
 ./build.bat          # Cross-compile for ARM
 # Copy to PYNQ, run with DOOM1.WAD
+```
+
+## After HLS Synthesis
+
+Check the Vitis HLS synthesis report for register offsets. Update doom_accel.h:
+
+```c
+#define REG_FB_OUT_LO      0x??  // From synthesis report
+#define REG_FB_OUT_HI      0x??
+#define REG_TEX_ATLAS_LO   0x??
+...
 ```
