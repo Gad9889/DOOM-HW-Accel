@@ -9,5 +9,16 @@
 Debug/
 Release/
 Build/
-doomgeneric
 doomgeneric.map
+
+# Build outputs
+doomgeneric/doom_stream
+doomgeneric/doomgeneric.bin
+doomgeneric/libdoom.so
+
+# WAD files (copyrighted)
+*.WAD
+*.wad
+
+# Don't ignore the doomgeneric directory itself
+!doomgeneric/
