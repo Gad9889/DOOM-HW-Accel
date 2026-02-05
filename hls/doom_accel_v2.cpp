@@ -21,7 +21,10 @@
 // Screen constants
 #define SCREEN_WIDTH  320
 #define SCREEN_HEIGHT 200
-#define FB_SIZE       (SCREEN_WIDTH * SCREEN_HEIGHT)  // 64000 bytes
+#define SBAR_HEIGHT   32   // Status bar (HUD) height at bottom of screen
+#define VIEW_HEIGHT   (SCREEN_HEIGHT - SBAR_HEIGHT)  // 168 rows for game view
+#define FB_SIZE       (SCREEN_WIDTH * SCREEN_HEIGHT)  // 64000 bytes total
+#define VIEW_SIZE     (SCREEN_WIDTH * VIEW_HEIGHT)    // 53760 bytes game view only
 #define FRACBITS      16
 
 // Colormap: 32 light levels x 256 palette entries = 8KB
@@ -237,10 +240,11 @@ void doom_accel(
     }
     else if (mode == MODE_DMA_OUT) {
         // --------------------------------------------------------------------
-        // DMA framebuffer BRAM to DDR
+        // DMA framebuffer BRAM to DDR - ONLY game view area (rows 0-167)
+        // The HUD (rows 168-199) is rendered by CPU and must be preserved
         // --------------------------------------------------------------------
         DMA_OUT:
-        for (int i = 0; i < FB_SIZE; i++) {
+        for (int i = 0; i < VIEW_SIZE; i++) {
             #pragma HLS PIPELINE II=1
             framebuffer_out[i] = local_framebuffer[i];
         }
