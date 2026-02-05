@@ -133,7 +133,10 @@ void HW_QueueColumn(int x, int y_start, int y_end, uint32_t frac, uint32_t step,
 void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
                   uint32_t tex_offset, int light_level);
 
-// Execute all queued commands and DMA result to DDR
+// Execute queued commands and DMA to DDR (call after floors, before sprites)
+void HW_FlushBatch(void);
+
+// Called at end of frame (no-op now since HW_FlushBatch does the work)
 void HW_FinishFrame(void);
 
 // Clear the framebuffer BRAM (call at level start, not every frame!)

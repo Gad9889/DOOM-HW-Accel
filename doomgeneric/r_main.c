@@ -881,6 +881,11 @@ void R_RenderPlayerView (player_t* player)
     
     R_DrawPlanes ();
     
+    // FPGA ACCELERATION: Flush walls + floors/ceilings batch BEFORE sprites
+    // This ensures FPGA content is in I_VideoBuffer so sprites draw on top
+    extern void HW_FlushBatch(void);
+    HW_FlushBatch();
+    
     // Check for new console commands.
     NetUpdate ();
     

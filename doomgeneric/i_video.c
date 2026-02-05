@@ -383,8 +383,9 @@ void I_FinishUpdate(void)
     // x_offset     = 0;
     x_offset_end = ((s_Fb.xres - (SCREENWIDTH * fb_scaling)) * s_Fb.bits_per_pixel / 8) - x_offset;
 
-    // Execute all queued FPGA commands and DMA framebuffer to DDR
-    HW_FinishFrame();
+    // NOTE: HW_FlushBatch() is called from R_RenderPlayerView() after walls+floors
+    // and before sprites, so sprites/HUD draw on top of FPGA content.
+    // HW_FinishFrame() is now a no-op kept for compatibility.
 
     /* DRAW SCREEN */
     line_in = (unsigned char *)I_VideoBuffer;

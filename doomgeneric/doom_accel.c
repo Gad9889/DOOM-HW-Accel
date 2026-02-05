@@ -354,21 +354,20 @@ void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
 }
 
 // ============================================================================
-// HW_FinishFrame - Execute all queued commands and DMA to DDR
+// HW_FlushBatch - Execute queued commands and DMA to DDR
+// Called after walls+floors, before sprites, so CPU can draw on top
 // ============================================================================
-void HW_FinishFrame(void)
+void HW_FlushBatch(void)
 {
     if (debug_sw_fallback || !accel_regs)
     {
-        // Software mode - already rendered during HW_QueueColumn
+        // Software mode - already rendered during HW_QueueColumn/HW_QueueSpan
         return;
     }
 
     if (cmd_count == 0)
     {
-        // No commands to process, but still need to DMA framebuffer out
-        // (for HUD-only frames)
-        fire_fpga(MODE_DMA_OUT, 0);
+        // No commands to process - nothing to flush
         return;
     }
 
@@ -378,11 +377,21 @@ void HW_FinishFrame(void)
     // Process batch
     fire_fpga(MODE_DRAW_BATCH, cmd_count);
 
-    // DMA framebuffer BRAM to DDR
+    // DMA framebuffer BRAM to DDR (so sprites can draw on top)
     fire_fpga(MODE_DMA_OUT, 0);
 
-    // Reset for next frame
+    // Reset command count (batch is done)
     cmd_count = 0;
+}
+
+// ============================================================================
+// HW_FinishFrame - Called at end of frame (now just a no-op)
+// The real work is done by HW_FlushBatch() called from R_RenderPlayerView
+// ============================================================================
+void HW_FinishFrame(void)
+{
+    // Nothing to do - HW_FlushBatch already handled the FPGA work
+    // This is kept for compatibility and in case we need end-of-frame logic
 }
 
 // ============================================================================
