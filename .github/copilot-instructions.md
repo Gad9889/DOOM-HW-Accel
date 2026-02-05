@@ -11,21 +11,28 @@
 
 FPGA-accelerated DOOM running on PYNQ board (Avnet Ultra96-V2 / aup-zu3).
 
-### Architecture (Batch Rendering v2)
+### Architecture (Batch Rendering v2 - Stage 1 Complete ✅)
 
 - **PS (Processing System)**: ARM CPU running Linux, handles:
   - Game logic, BSP traversal
-  - Sprites, floors/ceilings, HUD rendered via software to I_VideoBuffer
-  - Queues wall column commands for FPGA batch processing
+  - HUD/status bar rendered via software (rows 168-199, preserved by partial DMA)
+  - Queues ALL 3D rendering commands for FPGA batch processing
   - Scaling 320x200 → 1920x1080 in I_FinishUpdate()
   - Runs doomgeneric C engine
 
 - **PL (Programmable Logic)**: FPGA with custom HLS IP core:
   - **Colormap in BRAM** (8KB) - loaded once at level start, never reloaded
   - **Framebuffer in BRAM** (64KB) - 320x200 buffer, persists across frames
-  - **Batch processing** - receives all column commands at once, single handshake
+  - **Batch processing** - receives all column/span commands at once, single handshake
   - Reads textures from DDR via AXI Master (burst reads)
-  - DMAs framebuffer BRAM → DDR at frame end
+  - DMAs only VIEW area (rows 0-167) → DDR, preserving HUD
+
+- **FPGA Renders ALL 3D Content**:
+  - ✅ Walls (R_DrawColumn with drawing_wall=1)
+  - ✅ Floors/Ceilings (R_DrawSpan)
+  - ✅ Sprites (R_DrawColumn with drawing_sprite=1)
+  - ✅ Masked textures (mid-textures, also via drawing_sprite)
+  - ✅ Player weapon sprites (psprites)
 
 - **Memory Layout** (Physical DDR):
 
@@ -84,9 +91,20 @@ New batch approach:
 
 ### r_draw.c
 
-- `R_DrawColumn()`: When `drawing_wall=1` and FPGA available, calls `HW_QueueColumn()`
-- Sprites and software fallback use normal software path
+- `R_DrawColumn()`: Dispatches to FPGA when `(drawing_wall || drawing_sprite)` is set
+- `R_DrawSpan()`: Queues floor/ceiling spans to FPGA via `HW_QueueSpan()`
 - `drawing_wall` flag set in r_segs.c around `R_RenderSegLoop()`
+- `drawing_sprite` flag set in r_things.c around `R_DrawMasked()`
+
+### r_things.c
+
+- `R_DrawMasked()`: Sets `drawing_sprite=1`, renders all sprites/masked textures, then `HW_FlushBatch()`
+- Includes world sprites, masked mid-textures, and player weapon sprites
+
+### r_main.c
+
+- `R_RenderPlayerView()`: Calls `HW_FlushBatch()` after `R_DrawPlanes()` (walls+floors batch)
+- Then calls `R_DrawMasked()` which does its own `HW_FlushBatch()` (sprites batch)
 
 ### hls/doom_accel_v2.cpp
 
@@ -98,25 +116,47 @@ New batch approach:
   - MODE_DRAW_BATCH: Process N commands, prefetch texture per column
   - MODE_DMA_OUT: DMA framebuffer BRAM → DDR
 
-## DOOM Rendering Order
+## DOOM Rendering Order (Stage 1 - All 3D on FPGA)
 
-1. Walls - BSP traversal, front-to-back → **FPGA via HW_QueueColumn()**
-2. Floors/Ceilings - Visplanes (R_DrawSpan) → Software to I_VideoBuffer
-3. Sprites - Sorted by distance → Software to I_VideoBuffer
-4. HUD - Status bar, messages (V_DrawPatch) → Software to I_VideoBuffer
+1. **Walls** - BSP traversal, front-to-back → **FPGA via HW_QueueColumn()** (drawing_wall=1)
+2. **Floors/Ceilings** - Visplanes → **FPGA via HW_QueueSpan()**
+3. **HW_FlushBatch()** - Execute walls+floors batch, DMA to BRAM
+4. **Sprites** - Sorted by distance → **FPGA via HW_QueueColumn()** (drawing_sprite=1)
+5. **Masked textures** - Mid-textures on 2-sided linedefs → **FPGA** (drawing_sprite=1)
+6. **Player weapon** - psprites → **FPGA** (drawing_sprite=1)
+7. **HW_FlushBatch()** - Execute sprites batch, DMA to BRAM
+8. **HUD** - Status bar, messages → **Software** (rows 168-199, preserved)
 
-All rendered to same 320x200 buffer → correct z-ordering automatic.
+All 3D content rendered to FPGA BRAM framebuffer → DMA only VIEW area to DDR.
 
 ## Current Status
 
-### Working ✅
+### Stage 1 Complete ✅ - Full Hardware 3D Rendering
 
-- Batch rendering architecture designed
-- Command buffer structure defined
-- HLS IP v2 with BRAM colormap and framebuffer
-- Driver with HW_StartFrame/HW_QueueColumn/HW_FinishFrame API
+All 3D rendering now goes through FPGA:
+- ✅ Walls via `drawing_wall` flag
+- ✅ Floors/ceilings via `HW_QueueSpan()`
+- ✅ Sprites via `drawing_sprite` flag
+- ✅ Masked textures (mid-textures) via `drawing_sprite`
+- ✅ Player weapon sprites via `drawing_sprite`
+- ✅ HUD preserved (DMA only rows 0-167)
+- ✅ Menu working (rendered after FPGA flush)
 
-### TODO 🔧
+### Performance Issue 🔧
+
+Currently running at **~18 FPS** (target: 35+ FPS). Bottlenecks:
+1. **Per-command texture upload** - Upload_Texture_Data() called per column
+2. **DDR texture reads** - FPGA reads from slow DDR, not BRAM
+3. **No texture caching** - Same textures uploaded repeatedly
+4. **Sequential command processing** - Could parallelize
+
+### Stage 2 TODO - Performance Optimization
+
+1. Pre-load level textures to texture atlas at level start
+2. Cache texture offsets, avoid re-upload of same texture
+3. Add texture BRAM cache in HLS (LRU for hot textures)
+4. Pipeline command processing with texture prefetch
+5. Burst read optimization for texture columns
 
 1. Synthesize doom_accel_v2.cpp in Vitis HLS
 2. Update register offsets in doom_accel.h from synthesis report
@@ -127,9 +167,9 @@ All rendered to same 320x200 buffer → correct z-ordering automatic.
 ## Build & Run
 
 ```bash
-cd doomgeneric
-./build.bat          # Cross-compile for ARM
-# Copy to PYNQ, run with DOOM1.WAD
+cd doomgeneric/doomgeneric
+./build.bat          # Cross-compile for ARM (use cmd.exe or git bash on Windows)
+# Copy doom_stream to PYNQ, run with DOOM1.WAD
 ```
 
 ## After HLS Synthesis

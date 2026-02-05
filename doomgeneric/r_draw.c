@@ -93,6 +93,10 @@ int dccount;
 // 1 = drawing walls (use FPGA), 0 = drawing sprites (use software)
 int drawing_wall = 0;
 
+// Flag for sprite drawing (set during R_DrawMasked)
+// Allows FPGA to batch sprite columns separately from walls
+int drawing_sprite = 0;
+
 // Performance Counters for Hardware Accel Profiling
 int perf_drawcol_count = 0;
 int perf_drawcol_pixels = 0;
@@ -143,28 +147,28 @@ void R_DrawColumn(void)
     // This ensures correct z-ordering. Scaling happens in I_FinishUpdate.
     // ---------------------------------------------------------
 
-    // FPGA ACCELERATION: Queue wall columns for batch processing
-    // Sprites and other content use software for correct z-ordering
-    if (drawing_wall && accel_regs && !debug_sw_fallback)
+    // FPGA ACCELERATION: Queue wall or sprite columns for batch processing
+    if ((drawing_wall || drawing_sprite) && accel_regs && !debug_sw_fallback)
     {
-        // Get texture offset in atlas (texture should already be uploaded at level load)
-        // For now, upload per-column (TODO: pre-upload all level textures)
+        // Get texture offset in atlas
+        // Walls use fixed 128-byte columns, sprites use variable-length posts
         extern uint32_t Upload_Texture_Data(const uint8_t *source, int size);
-        uint32_t tex_offset = Upload_Texture_Data(dc_source, 128);
+        int tex_height = drawing_wall ? 128 : 128; // Sprites also use 128 for now
+        uint32_t tex_offset = Upload_Texture_Data(dc_source, tex_height);
 
         // Calculate light level (dc_colormap points into colormaps array)
         // Each light level is 256 bytes, so light_level = offset / 256
         extern byte *colormaps; // Base of all colormaps
         int light_level = (int)(dc_colormap - colormaps) / 256;
 
-        // Queue for FPGA batch processing (executed at I_FinishUpdate)
+        // Queue for FPGA batch processing
         extern void HW_QueueColumn(int x, int y_start, int y_end, uint32_t frac, uint32_t step,
                                    uint32_t tex_offset, int light_level);
         HW_QueueColumn(dc_x, dc_yl, dc_yh, frac, fracstep, tex_offset, light_level);
         return;
     }
 
-    // SOFTWARE PATH: Sprites, floors, HUD, or when FPGA not available
+    // SOFTWARE PATH: HUD, menu, or when FPGA not available
     do
     {
         // Re-map color indices from wall texture column

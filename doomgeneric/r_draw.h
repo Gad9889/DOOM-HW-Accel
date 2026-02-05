@@ -33,6 +33,10 @@ extern byte *dc_source;
 // Set to 1 before drawing walls, 0 for sprites/masked textures
 extern int drawing_wall;
 
+// Flag for sprite drawing (set during R_DrawMasked)
+// Allows FPGA to batch sprite columns separately from walls
+extern int drawing_sprite;
+
 // The span blitting interface.
 // Hook in assembler or system specific BLT
 //  here.
