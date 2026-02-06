@@ -344,6 +344,8 @@ int main(int argc, char **argv)
             {
                 double cmds_per_frame;
                 double fpga_wait_ms_per_frame;
+                double fpga_wait_idle_ms_per_frame;
+                double fpga_wait_done_ms_per_frame;
                 double tex_hit_rate;
                 double avg_scale;
                 double avg_game_hw;
@@ -355,6 +357,8 @@ int main(int argc, char **argv)
 
                 cmds_per_frame = (double)total_cmds / perf_frames;
                 fpga_wait_ms_per_frame = (double)hw_stats.fpga_wait_ns / perf_frames / 1000000.0;
+                fpga_wait_idle_ms_per_frame = (double)hw_stats.fpga_wait_idle_ns / perf_frames / 1000000.0;
+                fpga_wait_done_ms_per_frame = (double)hw_stats.fpga_wait_done_ns / perf_frames / 1000000.0;
                 avg_scale = (double)scale_ns / perf_frames / 1000000.0;
                 avg_game_hw = avg_render - avg_scale;
                 if (avg_game_hw < 0.0)
@@ -367,14 +371,17 @@ int main(int argc, char **argv)
 
                 printf("FPS: %.1f | Frame: %.2f ms | Render: %.2f ms | Game+HW: %.2f ms | Scale: %.2f ms | Send: %.2f ms | Tics: %d/s | Sx:%d\n",
                        fps, avg_tick, avg_render, avg_game_hw, avg_scale, avg_send, tics_per_sec, fb_scaling);
-                printf("HW: cmds/frame %.0f (col=%u span=%u) | flush=%u mid=%u max=%u | tex hit=%.1f%% miss=%u upload=%.1f KB wraps=%u entries=%u failins=%u | wait=%.2f ms/frame\n",
+                printf("HW: cmds/frame %.0f (col=%u span=%u) | flush=%u mid=%u max=%u | tex hit=%.1f%% miss=%u upload=%.1f KB wraps=%u entries=%u failins=%u | cmd up=%.1f KB | wait=%.2f ms/frame (idle=%.2f done=%.2f)\n",
                        cmds_per_frame,
                        hw_stats.queued_columns, hw_stats.queued_spans,
                        hw_stats.flush_calls, hw_stats.mid_frame_flushes, hw_stats.max_cmds_seen,
                        tex_hit_rate, hw_stats.tex_cache_misses,
                        (double)hw_stats.tex_upload_bytes / 1024.0,
                        hw_stats.tex_atlas_wraps, hw_stats.tex_cache_entries, hw_stats.tex_cache_failed_inserts,
-                       fpga_wait_ms_per_frame);
+                       (double)hw_stats.cmd_upload_bytes / 1024.0,
+                       fpga_wait_ms_per_frame,
+                       fpga_wait_idle_ms_per_frame,
+                       fpga_wait_done_ms_per_frame);
                 if (!debug_sw_fallback && hw_stats.flush_calls == 0)
                 {
                     printf("NOTE: HW mode active but no 3D HW commands this interval (not in level/gameplay path).\n");

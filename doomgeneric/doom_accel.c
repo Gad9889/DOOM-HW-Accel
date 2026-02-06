@@ -17,6 +17,9 @@ uint8_t *I_VideoBuffer_shared = NULL;
 DrawCommand *cmd_buffer_virt = NULL;
 uint8_t *tex_atlas_virt = NULL;
 uint8_t *colormap_virt = NULL;
+static DrawCommand *cmd_buffer_staging = NULL;
+static int use_cmd_staging = 0;
+static int fpga_batch_in_flight = 0;
 
 // Command buffer state
 uint32_t cmd_count = 0;
@@ -82,29 +85,33 @@ int debug_sw_fallback = 0; // 0 = use FPGA, 1 = software fallback
 // ============================================================================
 // HELPER: Wait for FPGA idle
 // ============================================================================
-static inline void wait_fpga_idle(void)
+static inline uint64_t wait_fpga_idle(void)
 {
     int timeout = 100000;
+    uint64_t wait_start = get_time_ns();
     while ((accel_regs[REG_CTRL / 4] & 0x4) == 0 && --timeout > 0)
         ;
     if (timeout == 0)
     {
         printf("WARN: FPGA idle timeout! CTRL=0x%08X\n", accel_regs[REG_CTRL / 4]);
     }
+    return get_time_ns() - wait_start;
 }
 
 // ============================================================================
 // HELPER: Wait for FPGA done
 // ============================================================================
-static inline void wait_fpga_done(void)
+static inline uint64_t wait_fpga_done(void)
 {
     int timeout = 1000000; // Longer timeout for batch processing
+    uint64_t wait_start = get_time_ns();
     while ((accel_regs[REG_CTRL / 4] & 0x2) == 0 && --timeout > 0)
         ;
     if (timeout == 0)
     {
         printf("ERR: FPGA done timeout! CTRL=0x%08X\n", accel_regs[REG_CTRL / 4]);
     }
+    return get_time_ns() - wait_start;
 }
 
 // ============================================================================
@@ -112,10 +119,13 @@ static inline void wait_fpga_done(void)
 // ============================================================================
 static void fire_fpga(uint32_t mode, uint32_t num_commands)
 {
-    uint64_t wait_start;
+    uint64_t wait_idle_ns;
+    uint64_t wait_done_ns;
 
     // Ensure FPGA is idle
-    wait_fpga_idle();
+    wait_idle_ns = wait_fpga_idle();
+    perf_stats.fpga_wait_idle_ns += wait_idle_ns;
+    perf_stats.fpga_wait_ns += wait_idle_ns;
 
     // Set mode and command count
     accel_regs[REG_MODE / 4] = mode;
@@ -128,9 +138,26 @@ static void fire_fpga(uint32_t mode, uint32_t num_commands)
     accel_regs[REG_CTRL / 4] = 0x1;
 
     // Wait for completion
-    wait_start = get_time_ns();
-    wait_fpga_done();
-    perf_stats.fpga_wait_ns += (get_time_ns() - wait_start);
+    wait_done_ns = wait_fpga_done();
+    perf_stats.fpga_wait_done_ns += wait_done_ns;
+    perf_stats.fpga_wait_ns += wait_done_ns;
+    fpga_batch_in_flight = 0;
+}
+
+static void fire_fpga_async(uint32_t mode, uint32_t num_commands)
+{
+    uint64_t wait_idle_ns;
+
+    // Ensure previous submission completed before reusing command DDR.
+    wait_idle_ns = wait_fpga_idle();
+    perf_stats.fpga_wait_idle_ns += wait_idle_ns;
+    perf_stats.fpga_wait_ns += wait_idle_ns;
+
+    accel_regs[REG_MODE / 4] = mode;
+    accel_regs[REG_NUM_COMMANDS / 4] = num_commands;
+    __sync_synchronize();
+    accel_regs[REG_CTRL / 4] = 0x1;
+    fpga_batch_in_flight = 1;
 }
 
 // ============================================================================
@@ -202,6 +229,23 @@ void Init_Doom_Accel(void)
     memset(I_VideoBuffer_shared, 0, 320 * 200);
     memset(cmd_buffer_virt, 0, CMD_BUF_SIZE);
 
+    // Stage 3.1: build commands in cached PS RAM, then upload in one burst.
+    if (!cmd_buffer_staging)
+    {
+        cmd_buffer_staging = (DrawCommand *)malloc(CMD_BUF_SIZE);
+    }
+    if (cmd_buffer_staging)
+    {
+        memset(cmd_buffer_staging, 0, CMD_BUF_SIZE);
+        use_cmd_staging = 1;
+        printf("Command staging: enabled (%u bytes cached buffer)\n", (unsigned)CMD_BUF_SIZE);
+    }
+    else
+    {
+        use_cmd_staging = 0;
+        printf("WARN: Command staging alloc failed, using direct /dev/mem writes\n");
+    }
+
     // Setup FPGA pointer addresses (tell AXI masters where memory is)
     accel_regs[REG_FB_OUT_LO / 4] = PHY_VIDEO_BUF;
     accel_regs[REG_FB_OUT_HI / 4] = 0;
@@ -223,6 +267,7 @@ void Init_Doom_Accel(void)
 
     cmd_count = 0;
     tex_atlas_offset = 0;
+    fpga_batch_in_flight = 0;
 
     printf("=== ACCEL INIT COMPLETE ===\n");
 }
@@ -397,10 +442,51 @@ void Reset_Texture_Atlas(void)
 // ============================================================================
 void HW_StartFrame(void)
 {
+    // Fence previous async submission before starting a new frame.
+    HW_WaitForBatch();
     cmd_count = 0;
     // NOTE: We do NOT clear framebuffer BRAM here!
     // HUD elements persist across frames. Only call HW_ClearFramebuffer()
     // at level transitions or when explicitly needed.
+}
+
+static void HW_FlushBatchInternal(int blocking)
+{
+    if (debug_sw_fallback || !accel_regs)
+    {
+        // Software mode - already rendered during HW_QueueColumn/HW_QueueSpan
+        return;
+    }
+
+    if (cmd_count == 0)
+    {
+        // No commands to process - nothing to flush
+        return;
+    }
+
+    // Command DDR region is reused every flush; fence before overwrite.
+    HW_WaitForBatch();
+
+    if (use_cmd_staging)
+    {
+        size_t bytes = (size_t)cmd_count * sizeof(DrawCommand);
+        memcpy(cmd_buffer_virt, cmd_buffer_staging, bytes);
+        perf_stats.cmd_upload_bytes += (uint64_t)bytes;
+    }
+
+    // Memory barrier to ensure all commands are written to DDR
+    __sync_synchronize();
+
+    // Submit draw + DMA and optionally wait (mid-frame overflow path).
+    perf_stats.flush_calls++;
+    fire_fpga_async(MODE_DRAW_AND_DMA, cmd_count);
+
+    if (blocking)
+    {
+        HW_WaitForBatch();
+    }
+
+    cmd_count = 0;
 }
 
 // ============================================================================
@@ -425,7 +511,7 @@ void HW_QueueColumn(int x, int y_start, int y_end, uint32_t frac, uint32_t step,
         // Buffer full - flush current batch and continue
         printf("WARN: Command buffer full (%u cmds), flushing mid-frame\n", cmd_count);
         perf_stats.mid_frame_flushes++;
-        HW_FlushBatch();
+        HW_FlushBatchInternal(1);
     }
 
     // Software fallback mode: draw directly
@@ -446,7 +532,7 @@ void HW_QueueColumn(int x, int y_start, int y_end, uint32_t frac, uint32_t step,
     }
 
     // Queue command for FPGA batch processing
-    DrawCommand *cmd = &cmd_buffer_virt[cmd_count];
+    DrawCommand *cmd = use_cmd_staging ? &cmd_buffer_staging[cmd_count] : &cmd_buffer_virt[cmd_count];
     cmd->cmd_type = CMD_TYPE_COLUMN;
     cmd->cmap_index = (uint8_t)(light_level & 31); // Clamp to 32 levels
     cmd->x1 = (uint16_t)x;
@@ -489,7 +575,7 @@ void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
     {
         printf("WARN: Command buffer full (%u cmds), flushing mid-frame\n", cmd_count);
         perf_stats.mid_frame_flushes++;
-        HW_FlushBatch();
+        HW_FlushBatchInternal(1);
     }
 
     // Software fallback mode: draw directly
@@ -509,7 +595,7 @@ void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
     }
 
     // Queue command for FPGA batch processing
-    DrawCommand *cmd = &cmd_buffer_virt[cmd_count];
+    DrawCommand *cmd = use_cmd_staging ? &cmd_buffer_staging[cmd_count] : &cmd_buffer_virt[cmd_count];
     cmd->cmd_type = CMD_TYPE_SPAN;
     cmd->cmap_index = (uint8_t)(light_level & 31);
     cmd->x1 = (uint16_t)x1;
@@ -537,27 +623,23 @@ void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
 // ============================================================================
 void HW_FlushBatch(void)
 {
-    if (debug_sw_fallback || !accel_regs)
+    // Stage 3.2: async submit; fence later at frame present.
+    HW_FlushBatchInternal(0);
+}
+
+void HW_WaitForBatch(void)
+{
+    uint64_t wait_done_ns;
+
+    if (debug_sw_fallback || !accel_regs || !fpga_batch_in_flight)
     {
-        // Software mode - already rendered during HW_QueueColumn/HW_QueueSpan
         return;
     }
 
-    if (cmd_count == 0)
-    {
-        // No commands to process - nothing to flush
-        return;
-    }
-
-    // Memory barrier to ensure all commands are written to DDR
-    __sync_synchronize();
-
-    // Combined draw + DMA in single FPGA invocation (saves one handshake)
-    perf_stats.flush_calls++;
-    fire_fpga(MODE_DRAW_AND_DMA, cmd_count);
-
-    // Reset command count (batch is done)
-    cmd_count = 0;
+    wait_done_ns = wait_fpga_done();
+    perf_stats.fpga_wait_done_ns += wait_done_ns;
+    perf_stats.fpga_wait_ns += wait_done_ns;
+    fpga_batch_in_flight = 0;
 }
 
 // ============================================================================
@@ -566,8 +648,8 @@ void HW_FlushBatch(void)
 // ============================================================================
 void HW_FinishFrame(void)
 {
-    // Nothing to do - HW_FlushBatch already handled the FPGA work
-    // This is kept for compatibility and in case we need end-of-frame logic
+    // Keep explicit fence hook for compatibility.
+    HW_WaitForBatch();
 }
 
 // ============================================================================

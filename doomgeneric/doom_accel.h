@@ -121,7 +121,10 @@ typedef struct
     uint32_t tex_cache_failed_inserts;
     uint32_t tex_atlas_wraps;
     uint64_t tex_upload_bytes;
+    uint64_t cmd_upload_bytes;
 
+    uint64_t fpga_wait_idle_ns;
+    uint64_t fpga_wait_done_ns;
     uint64_t fpga_wait_ns;
 } HWPerfStats;
 
@@ -156,6 +159,9 @@ void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
 
 // Execute queued commands and DMA to DDR (call after floors, before sprites)
 void HW_FlushBatch(void);
+
+// Wait for in-flight FPGA batch completion (fence).
+void HW_WaitForBatch(void);
 
 // Called at end of frame (no-op now since HW_FlushBatch does the work)
 void HW_FinishFrame(void);
