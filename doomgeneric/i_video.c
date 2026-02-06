@@ -328,8 +328,16 @@ extern void HW_FinishFrame(void);
 
 void I_StartFrame(void)
 {
-    // Reset the texture atlas offset for this frame
-    Reset_Texture_Atlas();
+    // IMPORTANT: Do NOT reset texture atlas per frame!
+    // The atlas persists across frames. DOOM reuses the same source pointers
+    // for textures (WAD lumps, composite cache), so the SW cache ensures
+    // each texture always lives at the same atlas offset. This keeps the
+    // FPGA's on-chip texture cache coherent (same offset = same data).
+    // Resetting per frame would assign different offsets to different textures
+    // across frames, causing FPGA cache hits to return stale/wrong data.
+    //
+    // Atlas is only reset at level transitions (HW_ClearFramebuffer).
+    // Overflow wraps with FPGA cache invalidation (Upload_Texture_Data).
 
     // Start FPGA batch processing for this frame
     HW_StartFrame();

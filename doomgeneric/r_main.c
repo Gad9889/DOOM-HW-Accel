@@ -820,10 +820,10 @@ void R_RenderPlayerView(player_t *player)
 
     R_DrawPlanes();
 
-    // FPGA ACCELERATION: Flush walls + floors/ceilings batch BEFORE sprites
-    // This ensures FPGA content is in I_VideoBuffer so sprites draw on top
-    extern void HW_FlushBatch(void);
-    HW_FlushBatch();
+    // NOTE: No intermediate HW_FlushBatch() here anymore.
+    // Since ALL 3D content (walls, floors, sprites) renders to FPGA BRAM,
+    // we accumulate all commands in one batch for a single FPGA invocation.
+    // R_DrawMasked() will call HW_FlushBatch() at the end.
 
     // Check for new console commands.
     NetUpdate();

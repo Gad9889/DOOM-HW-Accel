@@ -18,9 +18,9 @@
 // DDR Shared Memory Layout (32MB total region)
 #define PHY_FB_ADDR 0x70000000    // DG_ScreenBuffer (1920x1080x4 = 8MB)
 #define PHY_VIDEO_BUF 0x70800000  // I_VideoBuffer output (320x200 = 64KB)
-#define PHY_CMD_BUF 0x70810000    // Command Buffer (64KB, ~2000 commands max)
-#define PHY_TEX_ADDR 0x70820000   // Texture Atlas (16MB) - Level textures
-#define PHY_CMAP_ADDR 0x71820000  // Colormap (8KB = 32 levels x 256)
+#define PHY_CMD_BUF 0x70810000    // Command Buffer (128KB = 4000 cmds x 32B)
+#define PHY_TEX_ADDR 0x70830000   // Texture Atlas (16MB) - Level textures
+#define PHY_CMAP_ADDR 0x71830000  // Colormap (8KB = 32 levels x 256)
 #define MEM_BLOCK_SIZE 0x02000000 // 32MB total mapped region
 
 // ============================================================================
@@ -60,6 +60,7 @@ typedef struct __attribute__((packed))
 #define MODE_CLEAR_FB 2      // Clear framebuffer BRAM to color 0
 #define MODE_DRAW_BATCH 3    // Process all commands from command buffer
 #define MODE_DMA_OUT 4       // DMA framebuffer BRAM -> DDR
+#define MODE_DRAW_AND_DMA 6  // Combined draw + DMA (single handshake)
 
 // ============================================================================
 // REGISTER OFFSETS (Vitis HLS AXI-Lite CTRL bundle)

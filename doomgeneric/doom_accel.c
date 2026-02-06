@@ -1,4 +1,5 @@
 // doom_accel.c - FPGA Accelerator Driver for DOOM (Batch Rendering v2)
+// Stage 2: Performance Optimization with Texture Caching
 #include "doom_accel.h"
 #include "doomgeneric.h"
 #include <string.h>
@@ -22,6 +23,28 @@ uint32_t cmd_count = 0;
 // Texture atlas offset (for level texture uploads)
 uint32_t tex_atlas_offset = 0;
 #define TEX_ATLAS_SIZE (16 * 1024 * 1024) // 16MB
+
+// ============================================================================
+// TEXTURE OFFSET CACHE (Option A: Avoid re-uploading same textures)
+// ============================================================================
+#define TEX_CACHE_SIZE 4096 // Cache up to 4096 unique texture pointers
+
+typedef struct
+{
+    const uint8_t *source_ptr; // Original texture pointer (key)
+    uint32_t atlas_offset;     // Offset in texture atlas (value)
+    int size;                  // Size of texture data
+} TexCacheEntry;
+
+static TexCacheEntry tex_offset_cache[TEX_CACHE_SIZE];
+static int tex_cache_count = 0;
+
+// Simple hash function for texture pointer
+static inline uint32_t tex_ptr_hash(const uint8_t *ptr)
+{
+    // Use pointer bits as hash, mask to cache size
+    return ((uintptr_t)ptr >> 4) & (TEX_CACHE_SIZE - 1);
+}
 
 // Debug flags
 int debug_sw_fallback = 0; // 0 = use FPGA, 1 = software fallback
@@ -120,9 +143,9 @@ void Init_Doom_Accel(void)
     // Setup pointers based on memory layout:
     // 0x70000000: DG_ScreenBuffer (1920x1080x4 = 8MB)
     // 0x70800000: I_VideoBuffer output (320x200 = 64KB)
-    // 0x70810000: Command Buffer (64KB)
-    // 0x70820000: Texture Atlas (16MB)
-    // 0x71820000: Colormap (8KB)
+    // 0x70810000: Command Buffer (128KB = 4000 cmds x 32B)
+    // 0x70830000: Texture Atlas (16MB)
+    // 0x71830000: Colormap (8KB)
 
     DG_ScreenBuffer = (uint32_t *)shared_mem_virt;
     I_VideoBuffer_shared = (uint8_t *)shared_mem_virt + (PHY_VIDEO_BUF - PHY_FB_ADDR);
@@ -196,32 +219,86 @@ void Upload_Colormap(const uint8_t *colormaps_ptr, int size)
 
 // ============================================================================
 // Upload_Texture_Data - Copy texture data to atlas, return offset
+// Uses texture cache to avoid re-uploading same texture data
 // ============================================================================
 uint32_t Upload_Texture_Data(const uint8_t *source, int size)
 {
     if (!tex_atlas_virt || !source || size <= 0)
         return 0;
 
+    // ========== OPTION A: Check texture offset cache first ==========
+    uint32_t hash = tex_ptr_hash(source);
+
+    // Linear probing for collision resolution
+    for (int probe = 0; probe < 8; probe++)
+    {
+        uint32_t idx = (hash + probe) & (TEX_CACHE_SIZE - 1);
+
+        if (tex_offset_cache[idx].source_ptr == source &&
+            tex_offset_cache[idx].size == size)
+        {
+            // Cache hit! Return existing offset
+            return tex_offset_cache[idx].atlas_offset;
+        }
+
+        if (tex_offset_cache[idx].source_ptr == NULL)
+        {
+            // Empty slot - no more entries to check
+            break;
+        }
+    }
+
+    // ========== Cache miss - upload texture ==========
+
     // Check space (wrap if needed - shouldn't happen within a level)
     if (tex_atlas_offset + size > TEX_ATLAS_SIZE)
     {
         printf("WARN: Texture atlas overflow, wrapping\n");
         tex_atlas_offset = 0;
+        // Clear cache on wrap
+        memset(tex_offset_cache, 0, sizeof(tex_offset_cache));
+        tex_cache_count = 0;
+        // Invalidate FPGA texture caches (stale offsets after wrap)
+        if (accel_regs && !debug_sw_fallback)
+        {
+            fire_fpga(MODE_LOAD_COLORMAP, 0);
+        }
     }
 
-    uint32_t offset = tex_atlas_offset;
-    memcpy(tex_atlas_virt + offset, source, size);
-    tex_atlas_offset += size;
+    // Align to 16 bytes for optimal 128-bit AXI access
+    uint32_t aligned_offset = (tex_atlas_offset + 15) & ~15;
 
-    return offset;
+    memcpy(tex_atlas_virt + aligned_offset, source, size);
+    tex_atlas_offset = aligned_offset + size;
+
+    // ========== Store in cache ==========
+    for (int probe = 0; probe < 8; probe++)
+    {
+        uint32_t idx = (hash + probe) & (TEX_CACHE_SIZE - 1);
+
+        if (tex_offset_cache[idx].source_ptr == NULL)
+        {
+            tex_offset_cache[idx].source_ptr = source;
+            tex_offset_cache[idx].atlas_offset = aligned_offset;
+            tex_offset_cache[idx].size = size;
+            tex_cache_count++;
+            break;
+        }
+    }
+
+    return aligned_offset;
 }
 
 // ============================================================================
-// Reset_Texture_Atlas - Reset for new level
+// Reset_Texture_Atlas - Full reset for level transitions (clears everything)
 // ============================================================================
 void Reset_Texture_Atlas(void)
 {
     tex_atlas_offset = 0;
+
+    // Clear texture offset cache
+    memset(tex_offset_cache, 0, sizeof(tex_offset_cache));
+    tex_cache_count = 0;
 }
 
 // ============================================================================
@@ -254,10 +331,9 @@ void HW_QueueColumn(int x, int y_start, int y_end, uint32_t frac, uint32_t step,
     // Check buffer capacity
     if (cmd_count >= MAX_COMMANDS)
     {
-        // Buffer full - flush and continue
-        printf("WARN: Command buffer full, flushing mid-frame\n");
-        HW_FinishFrame();
-        cmd_count = 0;
+        // Buffer full - flush current batch and continue
+        printf("WARN: Command buffer full (%u cmds), flushing mid-frame\n", cmd_count);
+        HW_FlushBatch();
     }
 
     // Software fallback mode: draw directly
@@ -314,9 +390,8 @@ void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
     // Check buffer capacity
     if (cmd_count >= MAX_COMMANDS)
     {
-        printf("WARN: Command buffer full, flushing mid-frame\n");
-        HW_FinishFrame();
-        cmd_count = 0;
+        printf("WARN: Command buffer full (%u cmds), flushing mid-frame\n", cmd_count);
+        HW_FlushBatch();
     }
 
     // Software fallback mode: draw directly
@@ -374,11 +449,8 @@ void HW_FlushBatch(void)
     // Memory barrier to ensure all commands are written to DDR
     __sync_synchronize();
 
-    // Process batch
-    fire_fpga(MODE_DRAW_BATCH, cmd_count);
-
-    // DMA framebuffer BRAM to DDR (so sprites can draw on top)
-    fire_fpga(MODE_DMA_OUT, 0);
+    // Combined draw + DMA in single FPGA invocation (saves one handshake)
+    fire_fpga(MODE_DRAW_AND_DMA, cmd_count);
 
     // Reset command count (batch is done)
     cmd_count = 0;
@@ -410,4 +482,7 @@ void HW_ClearFramebuffer(void)
     }
 
     fire_fpga(MODE_CLEAR_FB, 0);
+
+    // Reset texture atlas on level transition (FPGA caches also invalidated)
+    Reset_Texture_Atlas();
 }
