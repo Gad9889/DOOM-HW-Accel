@@ -366,7 +366,6 @@ void I_ShutdownGraphics(void)
 extern void Reset_Texture_Atlas(void);
 extern void HW_StartFrame(void);
 extern void HW_FinishFrame(void);
-extern void HW_WaitForBatch(void);
 
 void I_StartFrame(void)
 {
@@ -426,12 +425,9 @@ void I_FinishUpdate(void)
     extern int DG_ShouldPresent(void);
     if (!DG_ShouldPresent())
     {
-        HW_WaitForBatch();
         return;
     }
 #endif
-
-    HW_WaitForBatch();
 
     // DEBUG: If set, skip the software copy entirely to see FPGA output alone
     if (debug_skip_sw_copy)
