@@ -13,6 +13,8 @@
 
 #include "doomgeneric.h"
 #include "doom_accel.h"
+#include "i_video.h"
+#include "d_loop.h"
 
 // Configuration
 #define LISTEN_PORT 5000
@@ -45,6 +47,23 @@ int key_tail = 0;
 // Globals
 int server_fd = -1;
 int client_fd = -1;
+static int bench_skip_present_no_client = 0;
+static int bench_force_sw = 0;
+static int bench_force_hw = 0;
+static int bench_skip_client_wait = 0;
+
+static int arg_eq(const char *a, const char *b)
+{
+    return strcmp(a, b) == 0;
+}
+
+int DG_ShouldPresent(void)
+{
+    if (!bench_skip_present_no_client)
+        return 1;
+
+    return client_fd >= 0;
+}
 
 void DG_Init()
 {
@@ -53,6 +72,14 @@ void DG_Init()
     int addrlen;
     int flag = 1;
     int flags;
+
+    if (bench_skip_client_wait)
+    {
+        printf("BENCH: skipping client wait (-no-client), networking disabled.\n");
+        server_fd = -1;
+        client_fd = -1;
+        return;
+    }
 
     // Create socket file descriptor
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0)
@@ -223,7 +250,53 @@ void DG_SetWindowTitle(const char *title)
 
 int main(int argc, char **argv)
 {
+    int perf_last_gametic = 0;
+
+    for (int i = 1; i < argc; i++)
+    {
+        if (arg_eq(argv[i], "-bench-headless") || arg_eq(argv[i], "-bench_headless") ||
+            arg_eq(argv[i], "-bench-nopresent") || arg_eq(argv[i], "-bench_nopresent"))
+        {
+            bench_skip_present_no_client = 1;
+        }
+        else if (arg_eq(argv[i], "-no-client") || arg_eq(argv[i], "-no_client") ||
+                 arg_eq(argv[i], "-bench-no-client") || arg_eq(argv[i], "-bench_noclient"))
+        {
+            bench_skip_client_wait = 1;
+        }
+        else if (arg_eq(argv[i], "-bench-sw") || arg_eq(argv[i], "-bench_sw"))
+        {
+            bench_force_sw = 1;
+        }
+        else if (arg_eq(argv[i], "-bench-hw") || arg_eq(argv[i], "-bench_hw"))
+        {
+            bench_force_hw = 1;
+        }
+    }
+
     Init_Doom_Accel();
+
+    if (bench_force_sw)
+    {
+        debug_sw_fallback = 1;
+        printf("BENCH: forcing software rendering path (debug_sw_fallback=1)\n");
+    }
+    if (bench_force_hw)
+    {
+        debug_sw_fallback = 0;
+        printf("BENCH: forcing hardware rendering path (debug_sw_fallback=0)\n");
+    }
+    if (bench_skip_present_no_client)
+    {
+        printf("BENCH: no-client present disabled (-bench-headless)\n");
+    }
+    if (bench_skip_client_wait)
+    {
+        printf("BENCH: startup without TCP client (-no-client)\n");
+    }
+    printf("BENCH: render mode %s (accel_regs=%p, fallback=%d)\n",
+           (accel_regs && !debug_sw_fallback) ? "HW" : "SW",
+           (void *)accel_regs, debug_sw_fallback);
 
     doomgeneric_Create(argc, argv);
 
@@ -241,15 +314,51 @@ int main(int argc, char **argv)
         if (end - perf_last_report >= 1000000000ULL)
         {
             double fps = (double)perf_frames;
+            HWPerfStats hw_stats;
+            uint64_t scale_ns = 0;
+            memset(&hw_stats, 0, sizeof(hw_stats));
+            HW_GetAndResetPerfStats(&hw_stats);
+            I_GetAndResetScalePerfNs(&scale_ns);
             // Avoid division by zero
             if (perf_frames > 0)
             {
+                double cmds_per_frame;
+                double fpga_wait_ms_per_frame;
+                double tex_hit_rate;
+                double avg_scale;
+                double avg_game_hw;
+                int tics_per_sec;
                 double avg_tick = (double)perf_tick_ns / perf_frames / 1000000.0; // ms
                 double avg_send = (double)perf_send_ns / perf_frames / 1000000.0; // ms
                 double avg_render = avg_tick - avg_send;
+                uint32_t total_cmds = hw_stats.queued_columns + hw_stats.queued_spans;
 
-                printf("FPS: %.1f | Frame: %.2f ms | Render: %.2f ms | Send: %.2f ms\n",
-                       fps, avg_tick, avg_render, avg_send);
+                cmds_per_frame = (double)total_cmds / perf_frames;
+                fpga_wait_ms_per_frame = (double)hw_stats.fpga_wait_ns / perf_frames / 1000000.0;
+                avg_scale = (double)scale_ns / perf_frames / 1000000.0;
+                avg_game_hw = avg_render - avg_scale;
+                if (avg_game_hw < 0.0)
+                    avg_game_hw = 0.0;
+                tics_per_sec = gametic - perf_last_gametic;
+                perf_last_gametic = gametic;
+                tex_hit_rate = (hw_stats.tex_cache_lookups > 0)
+                                   ? (100.0 * (double)hw_stats.tex_cache_hits / (double)hw_stats.tex_cache_lookups)
+                                   : 0.0;
+
+                printf("FPS: %.1f | Frame: %.2f ms | Render: %.2f ms | Game+HW: %.2f ms | Scale: %.2f ms | Send: %.2f ms | Tics: %d/s | Sx:%d\n",
+                       fps, avg_tick, avg_render, avg_game_hw, avg_scale, avg_send, tics_per_sec, fb_scaling);
+                printf("HW: cmds/frame %.0f (col=%u span=%u) | flush=%u mid=%u max=%u | tex hit=%.1f%% miss=%u upload=%.1f KB wraps=%u entries=%u failins=%u | wait=%.2f ms/frame\n",
+                       cmds_per_frame,
+                       hw_stats.queued_columns, hw_stats.queued_spans,
+                       hw_stats.flush_calls, hw_stats.mid_frame_flushes, hw_stats.max_cmds_seen,
+                       tex_hit_rate, hw_stats.tex_cache_misses,
+                       (double)hw_stats.tex_upload_bytes / 1024.0,
+                       hw_stats.tex_atlas_wraps, hw_stats.tex_cache_entries, hw_stats.tex_cache_failed_inserts,
+                       fpga_wait_ms_per_frame);
+                if (!debug_sw_fallback && hw_stats.flush_calls == 0)
+                {
+                    printf("NOTE: HW mode active but no 3D HW commands this interval (not in level/gameplay path).\n");
+                }
             }
 
             perf_frames = 0;

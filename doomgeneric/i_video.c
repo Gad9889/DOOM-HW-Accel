@@ -42,6 +42,7 @@ static const char
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <fcntl.h>
 
@@ -129,6 +130,16 @@ typedef struct
 // Palette converted to RGB565
 
 static uint16_t rgb565_palette[256];
+static uint32_t rgba_palette[256];
+
+static uint64_t perf_scale_ns = 0;
+
+static inline uint64_t video_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 void cmap_to_rgb565(uint16_t *out, uint8_t *in, int in_pixels)
 {
@@ -155,53 +166,72 @@ void cmap_to_rgb565(uint16_t *out, uint8_t *in, int in_pixels)
 void cmap_to_fb(uint8_t *out, uint8_t *in, int in_pixels)
 {
     int i, k;
-    struct color c;
-    uint32_t pix;
 
-    for (i = 0; i < in_pixels; i++)
+    if (s_Fb.bits_per_pixel == 16)
     {
-        c = colors[*in]; // R:8 G:8 B:8
+        uint16_t *out16 = (uint16_t *)out;
 
-        if (s_Fb.bits_per_pixel == 16)
+        if (fb_scaling == 1)
         {
-            // RGB565 packing
-            uint16_t p = ((c.r & 0xF8) << 8) |
-                         ((c.g & 0xFC) << 3) |
-                         (c.b >> 3);
+            for (i = 0; i < in_pixels; i++)
+            {
+                out16[i] = rgb565_palette[in[i]];
+            }
+            return;
+        }
 
-#ifdef SYS_BIG_ENDIAN
-            p = swapeLE16(p); // can't use SHORT() because this needs to stay unsigned
-#endif
+        for (i = 0; i < in_pixels; i++)
+        {
+            uint16_t p = rgb565_palette[*in++];
             for (k = 0; k < fb_scaling; k++)
             {
-                *(uint16_t *)out = p;
-                out += 2;
+                *out16++ = p;
             }
         }
-        else if (s_Fb.bits_per_pixel == 32)
-        {
-            // Assuming RGBA8888
-            pix = (c.r << s_Fb.red.offset) |
-                  (c.g << s_Fb.green.offset) |
-                  (c.b << s_Fb.blue.offset);
-
-#ifdef SYS_BIG_ENDIAN
-            pix = swapLE32(pix);
-#endif
-            for (k = 0; k < fb_scaling; k++)
-            {
-                *(uint32_t *)out = pix;
-                out += 4;
-            }
-        }
-        else
-        {
-            // no clue how to convert this
-            I_Error("No idea how to convert %d bpp pixels", s_Fb.bits_per_pixel);
-        }
-
-        in++;
+        return;
     }
+
+    if (s_Fb.bits_per_pixel == 32)
+    {
+        uint32_t *out32 = (uint32_t *)out;
+
+        if (fb_scaling == 1)
+        {
+            for (i = 0; i < in_pixels; i++)
+            {
+                out32[i] = rgba_palette[in[i]];
+            }
+            return;
+        }
+
+        if (fb_scaling == 5)
+        {
+            for (i = 0; i < in_pixels; i++)
+            {
+                uint32_t p = rgba_palette[*in++];
+                out32[0] = p;
+                out32[1] = p;
+                out32[2] = p;
+                out32[3] = p;
+                out32[4] = p;
+                out32 += 5;
+            }
+            return;
+        }
+
+        for (i = 0; i < in_pixels; i++)
+        {
+            uint32_t p = rgba_palette[*in++];
+            for (k = 0; k < fb_scaling; k++)
+            {
+                *out32++ = p;
+            }
+        }
+        return;
+    }
+
+    // no clue how to convert this
+    I_Error("No idea how to convert %d bpp pixels", s_Fb.bits_per_pixel);
 }
 
 // REMOVED: Transparent compositing approach was fundamentally flawed
@@ -372,8 +402,21 @@ static int debug_skip_sw_copy = 0;
 void I_FinishUpdate(void)
 {
     int y;
-    int x_offset, y_offset, x_offset_end;
+    int x_offset, y_offset;
+    int row_stride_bytes;
+    int scaled_row_bytes;
     unsigned char *line_in, *line_out;
+    uint64_t scale_start;
+
+#ifdef UDP_HEADLESS_BENCH
+    // Headless benchmark mode: when no viewer is connected on the UDP backend,
+    // skip CPU scaling/present so FPS reflects game + HW rendering only.
+    extern int DG_ShouldPresent(void);
+    if (!DG_ShouldPresent())
+    {
+        return;
+    }
+#endif
 
     // DEBUG: If set, skip the software copy entirely to see FPGA output alone
     if (debug_skip_sw_copy)
@@ -389,11 +432,13 @@ void I_FinishUpdate(void)
     y_offset = (((s_Fb.yres - (SCREENHEIGHT * fb_scaling)) * s_Fb.bits_per_pixel / 8)) / 2;
     x_offset = (((s_Fb.xres - (SCREENWIDTH * fb_scaling)) * s_Fb.bits_per_pixel / 8)) / 2; // XXX: siglent FB hack: /4 instead of /2, since it seems to handle the resolution in a funny way
     // x_offset     = 0;
-    x_offset_end = ((s_Fb.xres - (SCREENWIDTH * fb_scaling)) * s_Fb.bits_per_pixel / 8) - x_offset;
+    row_stride_bytes = s_Fb.xres * (s_Fb.bits_per_pixel / 8);
+    scaled_row_bytes = SCREENWIDTH * fb_scaling * (s_Fb.bits_per_pixel / 8);
 
     // NOTE: HW_FlushBatch() is called from R_RenderPlayerView() after walls+floors
     // and before sprites, so sprites/HUD draw on top of FPGA content.
     // HW_FinishFrame() is now a no-op kept for compatibility.
+    scale_start = video_now_ns();
 
     /* DRAW SCREEN */
     line_in = (unsigned char *)I_VideoBuffer;
@@ -403,39 +448,53 @@ void I_FinishUpdate(void)
 
     while (y--)
     {
+        unsigned char *line_out_row0;
         int i;
-        for (i = 0; i < fb_scaling; i++)
-        {
-            line_out += x_offset;
+        line_out_row0 = line_out + x_offset;
 #ifdef CMAP256
-            if (fb_scaling == 1)
-            {
-                memcpy(line_out, line_in, SCREENWIDTH); /* fb_width is bigger than Doom SCREENWIDTH... */
-            }
-            else
-            {
-                int j;
+        if (fb_scaling == 1)
+        {
+            memcpy(line_out_row0, line_in, SCREENWIDTH); /* fb_width is bigger than Doom SCREENWIDTH... */
+        }
+        else
+        {
+            int j;
 
-                for (j = 0; j < SCREENWIDTH; j++)
+            for (j = 0; j < SCREENWIDTH; j++)
+            {
+                int k;
+                for (k = 0; k < fb_scaling; k++)
                 {
-                    int k;
-                    for (k = 0; k < fb_scaling; k++)
-                    {
-                        line_out[j * fb_scaling + k] = line_in[j];
-                    }
+                    line_out_row0[j * fb_scaling + k] = line_in[j];
                 }
             }
-#else
-            // Scale and convert 320x200 8-bit palette to 1920x1080 32-bit RGBA
-            // UNIFIED BUFFER: Both FPGA walls and software content are in I_VideoBuffer
-            cmap_to_fb((void *)line_out, (void *)line_in, SCREENWIDTH);
-#endif
-            line_out += (SCREENWIDTH * fb_scaling * (s_Fb.bits_per_pixel / 8)) + x_offset_end;
         }
+#else
+        // Scale and convert 320x200 8-bit palette to RGBA on first row only.
+        // Then duplicate vertically with memcpy to avoid repeating conversion work.
+        cmap_to_fb((void *)line_out_row0, (void *)line_in, SCREENWIDTH);
+#endif
+
+        for (i = 1; i < fb_scaling; i++)
+        {
+            memcpy(line_out_row0 + (i * row_stride_bytes), line_out_row0, scaled_row_bytes);
+        }
+
+        line_out += fb_scaling * row_stride_bytes;
         line_in += SCREENWIDTH;
     }
 
+    perf_scale_ns += (video_now_ns() - scale_start);
     DG_DrawFrame();
+}
+
+void I_GetAndResetScalePerfNs(uint64_t *out_ns)
+{
+    if (!out_ns)
+        return;
+
+    *out_ns = perf_scale_ns;
+    perf_scale_ns = 0;
 }
 
 //
@@ -475,10 +534,33 @@ void I_SetPalette(byte *palette)
 
     for (i = 0; i < 256; ++i)
     {
+        uint8_t r;
+        uint8_t g;
+        uint8_t b;
+
         colors[i].a = 0;
         colors[i].r = gammatable[usegamma][*palette++];
         colors[i].g = gammatable[usegamma][*palette++];
         colors[i].b = gammatable[usegamma][*palette++];
+
+        r = colors[i].r;
+        g = colors[i].g;
+        b = colors[i].b;
+
+        // Prepack palette for fast per-pixel conversion.
+        rgb565_palette[i] = ((uint16_t)(r & 0xF8) << 8) |
+                            ((uint16_t)(g & 0xFC) << 3) |
+                            ((uint16_t)b >> 3);
+#ifdef SYS_BIG_ENDIAN
+        rgb565_palette[i] = swapeLE16(rgb565_palette[i]);
+#endif
+
+        rgba_palette[i] = ((uint32_t)r << s_Fb.red.offset) |
+                          ((uint32_t)g << s_Fb.green.offset) |
+                          ((uint32_t)b << s_Fb.blue.offset);
+#ifdef SYS_BIG_ENDIAN
+        rgba_palette[i] = swapLE32(rgba_palette[i]);
+#endif
     }
 
 #ifdef CMAP256

@@ -105,6 +105,26 @@ extern uint32_t tex_atlas_offset; // Current texture atlas write offset
 // Debug flags
 extern int debug_sw_fallback; // 1 = software rendering, 0 = FPGA
 
+// Runtime performance counters (sampled once per second by doomgeneric_udp)
+typedef struct
+{
+    uint32_t flush_calls;
+    uint32_t mid_frame_flushes;
+    uint32_t queued_columns;
+    uint32_t queued_spans;
+    uint32_t max_cmds_seen;
+
+    uint32_t tex_cache_entries;
+    uint32_t tex_cache_lookups;
+    uint32_t tex_cache_hits;
+    uint32_t tex_cache_misses;
+    uint32_t tex_cache_failed_inserts;
+    uint32_t tex_atlas_wraps;
+    uint64_t tex_upload_bytes;
+
+    uint64_t fpga_wait_ns;
+} HWPerfStats;
+
 // ============================================================================
 // FUNCTION PROTOTYPES
 // ============================================================================
@@ -142,5 +162,8 @@ void HW_FinishFrame(void);
 
 // Clear the framebuffer BRAM (call at level start, not every frame!)
 void HW_ClearFramebuffer(void);
+
+// Copy current hardware/texture perf counters and reset interval counters.
+void HW_GetAndResetPerfStats(HWPerfStats *out);
 
 #endif

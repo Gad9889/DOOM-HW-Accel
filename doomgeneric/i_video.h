@@ -21,6 +21,7 @@
 #define __I_VIDEO__
 
 #include "doomtype.h"
+#include <stdint.h>
 
 // Screen width and height.
 
@@ -106,6 +107,7 @@ int I_GetPaletteIndex(int r, int g, int b);
 
 void I_UpdateNoBlit (void);
 void I_FinishUpdate (void);
+void I_GetAndResetScalePerfNs(uint64_t *out_ns);
 
 void I_ReadScreen (byte* scr);
 
@@ -164,6 +166,7 @@ extern int aspect_ratio_correct;
 
 extern int show_diskicon;
 extern int diskicon_readbytes;
+extern int fb_scaling;
 
 #ifdef CMAP256
 

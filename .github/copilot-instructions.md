@@ -250,3 +250,57 @@ Critical implementation details for `hls/doom_accel_v3.cpp` after migrating AXI 
 
 - **Span safety in HLS path is explicit.**
   Span commands are clamped/checked in hardware (`y1`, `x1`, `x2`) before framebuffer writes.
+
+## Stage 2.2 Runtime Perf Telemetry + Texture Cache Hardening
+
+Host-side bottleneck debugging and mitigations added in `doomgeneric/doom_accel.c` and `doomgeneric/doomgeneric_udp.c`:
+
+- **Texture cache hash/probe hardening (CPU side):**
+  - Cache table increased from `4096` to `16384` entries.
+  - Pointer hash now uses mixed bits (not simple `ptr >> 4`) to avoid hot-bucket collisions from aligned column pointers.
+  - Probe path uses bounded probe first, then full-table fallback before declaring miss.
+  - If no free slot exists, home-bucket replacement is used (tracked as failed insert event).
+  - Added fast-path for repeated consecutive texture pointers.
+
+- **Why this matters:**
+  The previous hash/probe strategy could miss existing entries under collisions and repeatedly upload texture columns to uncached DDR, inflating frame time.
+
+- **New runtime counters (sampled once per second):**
+  - Command stats: queued columns/spans, flush count, mid-frame flushes, max commands in a batch.
+  - Texture stats: lookups/hits/misses, failed inserts, upload KB, atlas wraps, active entries.
+  - FPGA wait stats: average `ap_done` wait time per frame.
+
+- **Runtime output format:**
+  `doomgeneric_udp` now prints a second `HW:` line next to FPS so bottlenecks can be identified on real hardware quickly.
+
+## Stage 2.3 PS Memory Mapping Note (Critical for FPS)
+
+- On this platform, `/dev/mem` mappings used for FPGA shared DDR are typically non-cacheable from the CPU side.
+- CPU scaling (320x200 palette -> 1920x1080 RGBA) must **not** write into the MMIO shared DDR window each frame.
+- `DG_ScreenBuffer` is kept in normal cached userspace memory (malloc path in `doomgeneric.c`) for high CPU write bandwidth.
+- The MMIO shared region remains used for:
+  - `I_VideoBuffer_shared` (0x70800000)
+  - command buffer
+  - texture atlas
+  - colormap
+- This avoids a major PS bottleneck when hardware acceleration is enabled.
+
+## Stage 2.4 Headless Hardware Benchmark Mode
+
+- For true hardware-only profiling (no viewer connected), `build.bat` enables `-DUDP_HEADLESS_BENCH`.
+- Runtime startup switch: pass `-no-client` to skip blocking TCP accept (no connect/disconnect workaround needed).
+- Runtime switch: pass `-bench-headless` (or `-bench-nopresent`) to enable no-client present skip.
+- Without this switch, scaling/present logic stays active even if client disconnects (for apples-to-apples comparisons).
+- In headless mode, `i_video.c:I_FinishUpdate()` returns early when UDP backend reports no client connection.
+- Effect:
+  - Skips CPU scaling/conversion/present path when disconnected.
+  - FPS reflects game logic + command generation + FPGA execution more directly.
+- Runtime logs now include `Tics: N/s` to distinguish game tick pacing from render FPS.
+- This is benchmark-only behavior for the UDP backend path used in `doomgeneric/build.bat`.
+
+## Stage 2.5 CPU Scaling Optimization (5x critical)
+
+- `i_video.c:I_FinishUpdate()` now converts each source row once, then duplicates vertical rows with `memcpy`.
+- Previous behavior re-ran palette conversion for every vertically duplicated row (`fb_scaling` times), which heavily penalized higher scaling factors.
+- New behavior keeps visual output the same but reduces redundant conversion work, especially at `-scaling 5`.
+- `i_video.c:cmap_to_fb()` now uses prepacked palette caches (`rgb565_palette` / `rgba_palette`) and a fast path for 32-bit `fb_scaling=5` to reduce per-pixel arithmetic/loop overhead.

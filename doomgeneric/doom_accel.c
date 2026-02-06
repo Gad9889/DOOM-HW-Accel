@@ -4,6 +4,7 @@
 #include "doomgeneric.h"
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 // ============================================================================
 // GLOBALS
@@ -27,7 +28,8 @@ uint32_t tex_atlas_offset = 0;
 // ============================================================================
 // TEXTURE OFFSET CACHE (Option A: Avoid re-uploading same textures)
 // ============================================================================
-#define TEX_CACHE_SIZE 4096 // Cache up to 4096 unique texture pointers
+#define TEX_CACHE_SIZE 16384
+#define TEX_CACHE_MAX_PROBE 64
 
 typedef struct
 {
@@ -38,12 +40,40 @@ typedef struct
 
 static TexCacheEntry tex_offset_cache[TEX_CACHE_SIZE];
 static int tex_cache_count = 0;
+static const uint8_t *last_source_ptr = NULL;
+static int last_source_size = 0;
+static uint32_t last_source_offset = 0;
+static HWPerfStats perf_stats = {0};
 
-// Simple hash function for texture pointer
-static inline uint32_t tex_ptr_hash(const uint8_t *ptr)
+static inline uint64_t get_time_ns(void)
 {
-    // Use pointer bits as hash, mask to cache size
-    return ((uintptr_t)ptr >> 4) & (TEX_CACHE_SIZE - 1);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+// Mixed hash over pointer and size to avoid clustering on aligned texture columns.
+static inline uint32_t tex_ptr_hash(const uint8_t *ptr, int size)
+{
+#if UINTPTR_MAX > 0xFFFFFFFFu
+    uint64_t z = (uint64_t)(uintptr_t)ptr;
+    z ^= ((uint64_t)(uint32_t)size * 0x9E3779B1u);
+    z ^= z >> 33;
+    z *= 0xFF51AFD7ED558CCDULL;
+    z ^= z >> 33;
+    z *= 0xC4CEB9FE1A85EC53ULL;
+    z ^= z >> 33;
+    return (uint32_t)z & (TEX_CACHE_SIZE - 1);
+#else
+    uint32_t z = (uint32_t)(uintptr_t)ptr;
+    z ^= (uint32_t)size * 0x9E3779B1u;
+    z ^= z >> 16;
+    z *= 0x7FEB352DU;
+    z ^= z >> 15;
+    z *= 0x846CA68BU;
+    z ^= z >> 16;
+    return z & (TEX_CACHE_SIZE - 1);
+#endif
 }
 
 // Debug flags
@@ -82,6 +112,8 @@ static inline void wait_fpga_done(void)
 // ============================================================================
 static void fire_fpga(uint32_t mode, uint32_t num_commands)
 {
+    uint64_t wait_start;
+
     // Ensure FPGA is idle
     wait_fpga_idle();
 
@@ -96,7 +128,9 @@ static void fire_fpga(uint32_t mode, uint32_t num_commands)
     accel_regs[REG_CTRL / 4] = 0x1;
 
     // Wait for completion
+    wait_start = get_time_ns();
     wait_fpga_done();
+    perf_stats.fpga_wait_ns += (get_time_ns() - wait_start);
 }
 
 // ============================================================================
@@ -141,13 +175,11 @@ void Init_Doom_Accel(void)
     }
 
     // Setup pointers based on memory layout:
-    // 0x70000000: DG_ScreenBuffer (1920x1080x4 = 8MB)
+    // 0x70000000: MMIO output region (reserved for future HW upscale / direct scanout)
     // 0x70800000: I_VideoBuffer output (320x200 = 64KB)
     // 0x70810000: Command Buffer (128KB = 4000 cmds x 32B)
     // 0x70830000: Texture Atlas (16MB)
     // 0x71830000: Colormap (8KB)
-
-    DG_ScreenBuffer = (uint32_t *)shared_mem_virt;
     I_VideoBuffer_shared = (uint8_t *)shared_mem_virt + (PHY_VIDEO_BUF - PHY_FB_ADDR);
     cmd_buffer_virt = (DrawCommand *)((uint8_t *)shared_mem_virt + (PHY_CMD_BUF - PHY_FB_ADDR));
     tex_atlas_virt = (uint8_t *)shared_mem_virt + (PHY_TEX_ADDR - PHY_FB_ADDR);
@@ -158,14 +190,15 @@ void Init_Doom_Accel(void)
     I_VideoBuffer = I_VideoBuffer_shared;
 
     printf("Memory Layout:\n");
-    printf("  DG_ScreenBuffer: %p (phys 0x%08X)\n", DG_ScreenBuffer, PHY_FB_ADDR);
+    printf("  MMIO FB region:  %p (phys 0x%08X)\n", shared_mem_virt, PHY_FB_ADDR);
     printf("  I_VideoBuffer:   %p (phys 0x%08X)\n", I_VideoBuffer_shared, PHY_VIDEO_BUF);
     printf("  Command Buffer:  %p (phys 0x%08X)\n", cmd_buffer_virt, PHY_CMD_BUF);
     printf("  Texture Atlas:   %p (phys 0x%08X)\n", tex_atlas_virt, PHY_TEX_ADDR);
     printf("  Colormap:        %p (phys 0x%08X)\n", colormap_virt, PHY_CMAP_ADDR);
+    printf("  NOTE: DG_ScreenBuffer stays in cached DDR (malloc) for CPU scaling speed.\n");
 
     // Clear buffers
-    memset(DG_ScreenBuffer, 0, 1920 * 1080 * 4);
+    memset(shared_mem_virt, 0, 1920 * 1080 * 4);
     memset(I_VideoBuffer_shared, 0, 320 * 200);
     memset(cmd_buffer_virt, 0, CMD_BUF_SIZE);
 
@@ -223,14 +256,25 @@ void Upload_Colormap(const uint8_t *colormaps_ptr, int size)
 // ============================================================================
 uint32_t Upload_Texture_Data(const uint8_t *source, int size)
 {
+    int empty_idx = -1;
+
     if (!tex_atlas_virt || !source || size <= 0)
         return 0;
 
+    perf_stats.tex_cache_lookups++;
+
+    // Fast path for repeated pointer in consecutive draw calls.
+    if (source == last_source_ptr && size == last_source_size)
+    {
+        perf_stats.tex_cache_hits++;
+        return last_source_offset;
+    }
+
     // ========== OPTION A: Check texture offset cache first ==========
-    uint32_t hash = tex_ptr_hash(source);
+    uint32_t hash = tex_ptr_hash(source, size);
 
     // Linear probing for collision resolution
-    for (int probe = 0; probe < 8; probe++)
+    for (int probe = 0; probe < TEX_CACHE_MAX_PROBE; probe++)
     {
         uint32_t idx = (hash + probe) & (TEX_CACHE_SIZE - 1);
 
@@ -238,15 +282,46 @@ uint32_t Upload_Texture_Data(const uint8_t *source, int size)
             tex_offset_cache[idx].size == size)
         {
             // Cache hit! Return existing offset
+            perf_stats.tex_cache_hits++;
+            last_source_ptr = source;
+            last_source_size = size;
+            last_source_offset = tex_offset_cache[idx].atlas_offset;
             return tex_offset_cache[idx].atlas_offset;
         }
 
-        if (tex_offset_cache[idx].source_ptr == NULL)
+        if (tex_offset_cache[idx].source_ptr == NULL && empty_idx < 0)
         {
-            // Empty slot - no more entries to check
+            empty_idx = (int)idx;
             break;
         }
     }
+
+    // Fallback full scan only when bounded probe cannot resolve collisions.
+    if (empty_idx < 0)
+    {
+        for (int probe = TEX_CACHE_MAX_PROBE; probe < TEX_CACHE_SIZE; probe++)
+        {
+            uint32_t idx = (hash + probe) & (TEX_CACHE_SIZE - 1);
+
+            if (tex_offset_cache[idx].source_ptr == source &&
+                tex_offset_cache[idx].size == size)
+            {
+                perf_stats.tex_cache_hits++;
+                last_source_ptr = source;
+                last_source_size = size;
+                last_source_offset = tex_offset_cache[idx].atlas_offset;
+                return tex_offset_cache[idx].atlas_offset;
+            }
+
+            if (tex_offset_cache[idx].source_ptr == NULL)
+            {
+                empty_idx = (int)idx;
+                break;
+            }
+        }
+    }
+
+    perf_stats.tex_cache_misses++;
 
     // ========== Cache miss - upload texture ==========
 
@@ -254,10 +329,15 @@ uint32_t Upload_Texture_Data(const uint8_t *source, int size)
     if (tex_atlas_offset + size > TEX_ATLAS_SIZE)
     {
         printf("WARN: Texture atlas overflow, wrapping\n");
+        perf_stats.tex_atlas_wraps++;
         tex_atlas_offset = 0;
         // Clear cache on wrap
         memset(tex_offset_cache, 0, sizeof(tex_offset_cache));
         tex_cache_count = 0;
+        empty_idx = -1;
+        last_source_ptr = NULL;
+        last_source_size = 0;
+        last_source_offset = 0;
         // Invalidate FPGA texture caches (stale offsets after wrap)
         if (accel_regs && !debug_sw_fallback)
         {
@@ -269,22 +349,30 @@ uint32_t Upload_Texture_Data(const uint8_t *source, int size)
     uint32_t aligned_offset = (tex_atlas_offset + 15) & ~15;
 
     memcpy(tex_atlas_virt + aligned_offset, source, size);
+    perf_stats.tex_upload_bytes += (uint64_t)size;
     tex_atlas_offset = aligned_offset + size;
 
     // ========== Store in cache ==========
-    for (int probe = 0; probe < 8; probe++)
+    if (empty_idx >= 0)
     {
-        uint32_t idx = (hash + probe) & (TEX_CACHE_SIZE - 1);
-
-        if (tex_offset_cache[idx].source_ptr == NULL)
-        {
-            tex_offset_cache[idx].source_ptr = source;
-            tex_offset_cache[idx].atlas_offset = aligned_offset;
-            tex_offset_cache[idx].size = size;
-            tex_cache_count++;
-            break;
-        }
+        tex_offset_cache[empty_idx].source_ptr = source;
+        tex_offset_cache[empty_idx].atlas_offset = aligned_offset;
+        tex_offset_cache[empty_idx].size = size;
+        tex_cache_count++;
     }
+    else
+    {
+        // Table is effectively saturated in this hash neighborhood.
+        // Replace home bucket so future accesses to this source hit.
+        perf_stats.tex_cache_failed_inserts++;
+        tex_offset_cache[hash].source_ptr = source;
+        tex_offset_cache[hash].atlas_offset = aligned_offset;
+        tex_offset_cache[hash].size = size;
+    }
+
+    last_source_ptr = source;
+    last_source_size = size;
+    last_source_offset = aligned_offset;
 
     return aligned_offset;
 }
@@ -299,6 +387,9 @@ void Reset_Texture_Atlas(void)
     // Clear texture offset cache
     memset(tex_offset_cache, 0, sizeof(tex_offset_cache));
     tex_cache_count = 0;
+    last_source_ptr = NULL;
+    last_source_size = 0;
+    last_source_offset = 0;
 }
 
 // ============================================================================
@@ -333,6 +424,7 @@ void HW_QueueColumn(int x, int y_start, int y_end, uint32_t frac, uint32_t step,
     {
         // Buffer full - flush current batch and continue
         printf("WARN: Command buffer full (%u cmds), flushing mid-frame\n", cmd_count);
+        perf_stats.mid_frame_flushes++;
         HW_FlushBatch();
     }
 
@@ -369,6 +461,11 @@ void HW_QueueColumn(int x, int y_start, int y_end, uint32_t frac, uint32_t step,
     cmd->reserved3 = 0;
 
     cmd_count++;
+    perf_stats.queued_columns++;
+    if (cmd_count > perf_stats.max_cmds_seen)
+    {
+        perf_stats.max_cmds_seen = cmd_count;
+    }
 }
 
 // ============================================================================
@@ -391,6 +488,7 @@ void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
     if (cmd_count >= MAX_COMMANDS)
     {
         printf("WARN: Command buffer full (%u cmds), flushing mid-frame\n", cmd_count);
+        perf_stats.mid_frame_flushes++;
         HW_FlushBatch();
     }
 
@@ -426,6 +524,11 @@ void HW_QueueSpan(int y, int x1, int x2, uint32_t position, uint32_t step,
     cmd->reserved3 = 0;
 
     cmd_count++;
+    perf_stats.queued_spans++;
+    if (cmd_count > perf_stats.max_cmds_seen)
+    {
+        perf_stats.max_cmds_seen = cmd_count;
+    }
 }
 
 // ============================================================================
@@ -450,6 +553,7 @@ void HW_FlushBatch(void)
     __sync_synchronize();
 
     // Combined draw + DMA in single FPGA invocation (saves one handshake)
+    perf_stats.flush_calls++;
     fire_fpga(MODE_DRAW_AND_DMA, cmd_count);
 
     // Reset command count (batch is done)
@@ -485,4 +589,14 @@ void HW_ClearFramebuffer(void)
 
     // Reset texture atlas on level transition (FPGA caches also invalidated)
     Reset_Texture_Atlas();
+}
+
+void HW_GetAndResetPerfStats(HWPerfStats *out)
+{
+    if (!out)
+        return;
+
+    *out = perf_stats;
+    out->tex_cache_entries = (uint32_t)tex_cache_count;
+    memset(&perf_stats, 0, sizeof(perf_stats));
 }
