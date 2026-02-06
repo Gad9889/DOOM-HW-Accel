@@ -259,6 +259,8 @@ void DG_SetWindowTitle(const char *title)
 int main(int argc, char **argv)
 {
     int perf_last_gametic = 0;
+    int stream_mode_explicit = 0;
+    int requested_scaling = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -283,11 +285,35 @@ int main(int argc, char **argv)
         else if (arg_eq(argv[i], "-native320") || arg_eq(argv[i], "-native_320"))
         {
             bench_native_320 = 1;
+            stream_mode_explicit = 1;
         }
         else if (arg_eq(argv[i], "-fullres") || arg_eq(argv[i], "-full_res"))
         {
             bench_native_320 = 0;
+            stream_mode_explicit = 1;
         }
+        else if (arg_eq(argv[i], "-scaling") && (i + 1) < argc)
+        {
+            requested_scaling = atoi(argv[i + 1]);
+            i++;
+        }
+    }
+
+    if (!stream_mode_explicit && requested_scaling > 1)
+    {
+        bench_native_320 = 0;
+        printf("BENCH: auto-selecting fullres because -scaling %d was requested\n", requested_scaling);
+    }
+
+    if (bench_native_320 && requested_scaling > 1)
+    {
+        printf("NOTE: -native320 forces scaling=1; use -fullres to benchmark -scaling %d\n",
+               requested_scaling);
+    }
+
+    if (requested_scaling <= 0)
+    {
+        requested_scaling = 1;
     }
 
     Init_Doom_Accel();

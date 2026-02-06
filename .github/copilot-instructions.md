@@ -314,3 +314,18 @@ Host-side bottleneck debugging and mitigations added in `doomgeneric/doom_accel.
 - `i_video.c` checks backend stream mode and, in native mode, forces `fb_scaling=1` and output resolution to 320x200.
 - This removes 1080p expansion from PS in Stage 3 and keeps frame transport focused on native DOOM resolution.
 - `doom_udp_viewer.py` updated to receive 320x200 stream and scale on PC client side (`DISPLAY_SCALE`).
+
+## Stage 3.3 (Validated) Async Present + Correct Scaling Mode Selection
+
+- Added optional async present path in `i_video.c` enabled with `-async-present`:
+  - Main game/render thread enqueues a 320x200 snapshot (`I_VideoBuffer`) into a small queue.
+  - A worker thread performs scale/convert + `DG_DrawFrame()` on queued frames.
+- Measured result:
+  - At `-scaling 5`, async present reduces PS-side present bottleneck and improved HW path FPS versus sync path.
+- Added stream-mode guard in `doomgeneric_udp.c`:
+  - If `-scaling > 1` and no explicit `-native320/-fullres` is provided, runtime auto-selects `fullres`.
+  - If `-native320` is explicitly set with `-scaling > 1`, runtime prints a note that native mode forces scaling=1.
+- Build note:
+  - `doomgeneric/build.bat` links with `-pthread`.
+- Safety:
+  - Default behavior remains synchronous unless `-async-present` is passed.

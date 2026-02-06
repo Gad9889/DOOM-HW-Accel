@@ -43,6 +43,7 @@ static const char
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 
 #include <fcntl.h>
 
@@ -132,7 +133,20 @@ typedef struct
 static uint16_t rgb565_palette[256];
 static uint32_t rgba_palette[256];
 
-static uint64_t perf_scale_ns = 0;
+static volatile uint64_t perf_scale_ns = 0;
+
+#define ASYNC_PRESENT_QUEUE_DEPTH 3
+
+static int async_present_enabled = 0;
+static int async_present_thread_started = 0;
+static int async_present_shutdown = 0;
+static int async_present_q_head = 0;
+static int async_present_q_tail = 0;
+static int async_present_q_count = 0;
+static pthread_t async_present_thread;
+static pthread_mutex_t async_present_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t async_present_cv = PTHREAD_COND_INITIALIZER;
+static uint8_t async_present_queue[ASYNC_PRESENT_QUEUE_DEPTH][SCREENWIDTH * SCREENHEIGHT];
 
 static inline uint64_t video_now_ns(void)
 {
@@ -232,6 +246,142 @@ void cmap_to_fb(uint8_t *out, uint8_t *in, int in_pixels)
 
     // no clue how to convert this
     I_Error("No idea how to convert %d bpp pixels", s_Fb.bits_per_pixel);
+}
+
+static void I_BlitScaledFrame(const unsigned char *src_frame)
+{
+    int y;
+    int x_offset;
+    int row_stride_bytes;
+    int scaled_row_bytes;
+    unsigned char *line_in;
+    unsigned char *line_out;
+
+    x_offset = (((s_Fb.xres - (SCREENWIDTH * fb_scaling)) * s_Fb.bits_per_pixel / 8)) / 2;
+    row_stride_bytes = s_Fb.xres * (s_Fb.bits_per_pixel / 8);
+    scaled_row_bytes = SCREENWIDTH * fb_scaling * (s_Fb.bits_per_pixel / 8);
+
+    line_in = (unsigned char *)src_frame;
+    line_out = (unsigned char *)DG_ScreenBuffer;
+
+    y = SCREENHEIGHT;
+
+    while (y--)
+    {
+        unsigned char *line_out_row0;
+        int i;
+        line_out_row0 = line_out + x_offset;
+#ifdef CMAP256
+        if (fb_scaling == 1)
+        {
+            memcpy(line_out_row0, line_in, SCREENWIDTH);
+        }
+        else
+        {
+            int j;
+
+            for (j = 0; j < SCREENWIDTH; j++)
+            {
+                int k;
+                for (k = 0; k < fb_scaling; k++)
+                {
+                    line_out_row0[j * fb_scaling + k] = line_in[j];
+                }
+            }
+        }
+#else
+        // Convert+scale once, then duplicate vertically with memcpy.
+        cmap_to_fb((void *)line_out_row0, (void *)line_in, SCREENWIDTH);
+#endif
+
+        for (i = 1; i < fb_scaling; i++)
+        {
+            memcpy(line_out_row0 + (i * row_stride_bytes), line_out_row0, scaled_row_bytes);
+        }
+
+        line_out += fb_scaling * row_stride_bytes;
+        line_in += SCREENWIDTH;
+    }
+}
+
+static void *I_AsyncPresentWorker(void *arg)
+{
+    (void)arg;
+
+    for (;;)
+    {
+        int slot;
+        uint64_t scale_start;
+        uint64_t scale_ns;
+
+        pthread_mutex_lock(&async_present_mutex);
+        while (async_present_q_count == 0 && !async_present_shutdown)
+        {
+            pthread_cond_wait(&async_present_cv, &async_present_mutex);
+        }
+
+        if (async_present_q_count == 0 && async_present_shutdown)
+        {
+            pthread_mutex_unlock(&async_present_mutex);
+            break;
+        }
+
+        slot = async_present_q_head;
+        async_present_q_head = (async_present_q_head + 1) % ASYNC_PRESENT_QUEUE_DEPTH;
+        async_present_q_count--;
+        pthread_cond_broadcast(&async_present_cv);
+        pthread_mutex_unlock(&async_present_mutex);
+
+        scale_start = video_now_ns();
+        I_BlitScaledFrame(async_present_queue[slot]);
+        scale_ns = video_now_ns() - scale_start;
+        __sync_fetch_and_add(&perf_scale_ns, scale_ns);
+        DG_DrawFrame();
+    }
+
+    return NULL;
+}
+
+static void I_InitAsyncPresent(void)
+{
+    int rc;
+
+    if (!async_present_enabled || async_present_thread_started)
+        return;
+
+    async_present_shutdown = 0;
+    async_present_q_head = 0;
+    async_present_q_tail = 0;
+    async_present_q_count = 0;
+
+    rc = pthread_create(&async_present_thread, NULL, I_AsyncPresentWorker, NULL);
+    if (rc != 0)
+    {
+        async_present_enabled = 0;
+        printf("WARN: async present thread create failed (rc=%d), falling back to sync present\n", rc);
+        return;
+    }
+
+    async_present_thread_started = 1;
+    printf("I_InitGraphics: Async present enabled (queue=%d)\n", ASYNC_PRESENT_QUEUE_DEPTH);
+}
+
+static void I_ShutdownAsyncPresent(void)
+{
+    if (!async_present_thread_started)
+        return;
+
+    pthread_mutex_lock(&async_present_mutex);
+    async_present_shutdown = 1;
+    pthread_cond_broadcast(&async_present_cv);
+    pthread_mutex_unlock(&async_present_mutex);
+
+    pthread_join(async_present_thread, NULL);
+    async_present_thread_started = 0;
+    async_present_shutdown = 0;
+    async_present_q_head = 0;
+    async_present_q_tail = 0;
+    async_present_q_count = 0;
 }
 
 // REMOVED: Transparent compositing approach was fundamentally flawed
@@ -336,6 +486,15 @@ void I_InitGraphics(void)
         printf("I_InitGraphics: Auto-scaling factor: %d\n", fb_scaling);
     }
 
+    if (M_CheckParm("-async-present") > 0 || M_CheckParm("-async_present") > 0)
+    {
+        async_present_enabled = 1;
+    }
+    if (M_CheckParm("-sync-present") > 0 || M_CheckParm("-sync_present") > 0)
+    {
+        async_present_enabled = 0;
+    }
+
     /* Allocate screen to draw to (skip if already set by hardware init) */
     if (I_VideoBuffer == NULL)
     {
@@ -350,10 +509,14 @@ void I_InitGraphics(void)
 
     extern void I_InitInput(void);
     I_InitInput();
+
+    I_InitAsyncPresent();
 }
 
 void I_ShutdownGraphics(void)
 {
+    I_ShutdownAsyncPresent();
+
     // Only free if allocated by Z_Malloc (not shared DDR)
     extern uint8_t *I_VideoBuffer_shared;
     if (I_VideoBuffer != I_VideoBuffer_shared)
@@ -412,12 +575,8 @@ static int debug_skip_sw_copy = 0;
 
 void I_FinishUpdate(void)
 {
-    int y;
-    int x_offset, y_offset;
-    int row_stride_bytes;
-    int scaled_row_bytes;
-    unsigned char *line_in, *line_out;
     uint64_t scale_start;
+    uint64_t scale_ns;
 
 #ifdef UDP_HEADLESS_BENCH
     // Headless benchmark mode: when no viewer is connected on the UDP backend,
@@ -436,66 +595,27 @@ void I_FinishUpdate(void)
         return;
     }
 
-    /* Offsets in case FB is bigger than DOOM */
-    /* 600 = s_Fb heigt, 200 screenheight */
-    /* 600 = s_Fb heigt, 200 screenheight */
-    /* 2048 =s_Fb width, 320 screenwidth */
-    y_offset = (((s_Fb.yres - (SCREENHEIGHT * fb_scaling)) * s_Fb.bits_per_pixel / 8)) / 2;
-    x_offset = (((s_Fb.xres - (SCREENWIDTH * fb_scaling)) * s_Fb.bits_per_pixel / 8)) / 2; // XXX: siglent FB hack: /4 instead of /2, since it seems to handle the resolution in a funny way
-    // x_offset     = 0;
-    row_stride_bytes = s_Fb.xres * (s_Fb.bits_per_pixel / 8);
-    scaled_row_bytes = SCREENWIDTH * fb_scaling * (s_Fb.bits_per_pixel / 8);
-
-    // NOTE: HW_FlushBatch() is called from R_RenderPlayerView() after walls+floors
-    // and before sprites, so sprites/HUD draw on top of FPGA content.
-    // HW_FinishFrame() is now a no-op kept for compatibility.
-    scale_start = video_now_ns();
-
-    /* DRAW SCREEN */
-    line_in = (unsigned char *)I_VideoBuffer;
-    line_out = (unsigned char *)DG_ScreenBuffer;
-
-    y = SCREENHEIGHT;
-
-    while (y--)
+    if (async_present_enabled && async_present_thread_started)
     {
-        unsigned char *line_out_row0;
-        int i;
-        line_out_row0 = line_out + x_offset;
-#ifdef CMAP256
-        if (fb_scaling == 1)
+        int slot;
+        pthread_mutex_lock(&async_present_mutex);
+        while (async_present_q_count >= ASYNC_PRESENT_QUEUE_DEPTH)
         {
-            memcpy(line_out_row0, line_in, SCREENWIDTH); /* fb_width is bigger than Doom SCREENWIDTH... */
+            pthread_cond_wait(&async_present_cv, &async_present_mutex);
         }
-        else
-        {
-            int j;
-
-            for (j = 0; j < SCREENWIDTH; j++)
-            {
-                int k;
-                for (k = 0; k < fb_scaling; k++)
-                {
-                    line_out_row0[j * fb_scaling + k] = line_in[j];
-                }
-            }
-        }
-#else
-        // Scale and convert 320x200 8-bit palette to RGBA on first row only.
-        // Then duplicate vertically with memcpy to avoid repeating conversion work.
-        cmap_to_fb((void *)line_out_row0, (void *)line_in, SCREENWIDTH);
-#endif
-
-        for (i = 1; i < fb_scaling; i++)
-        {
-            memcpy(line_out_row0 + (i * row_stride_bytes), line_out_row0, scaled_row_bytes);
-        }
-
-        line_out += fb_scaling * row_stride_bytes;
-        line_in += SCREENWIDTH;
+        slot = async_present_q_tail;
+        async_present_q_tail = (async_present_q_tail + 1) % ASYNC_PRESENT_QUEUE_DEPTH;
+        async_present_q_count++;
+        memcpy(async_present_queue[slot], I_VideoBuffer, SCREENWIDTH * SCREENHEIGHT);
+        pthread_cond_signal(&async_present_cv);
+        pthread_mutex_unlock(&async_present_mutex);
+        return;
     }
 
-    perf_scale_ns += (video_now_ns() - scale_start);
+    scale_start = video_now_ns();
+    I_BlitScaledFrame((unsigned char *)I_VideoBuffer);
+    scale_ns = video_now_ns() - scale_start;
+    __sync_fetch_and_add(&perf_scale_ns, scale_ns);
     DG_DrawFrame();
 }
 
@@ -504,8 +624,7 @@ void I_GetAndResetScalePerfNs(uint64_t *out_ns)
     if (!out_ns)
         return;
 
-    *out_ns = perf_scale_ns;
-    perf_scale_ns = 0;
+    *out_ns = __sync_lock_test_and_set(&perf_scale_ns, 0);
 }
 
 //

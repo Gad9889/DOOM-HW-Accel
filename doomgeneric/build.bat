@@ -11,7 +11,7 @@ set CC=aarch64-none-linux-gnu-gcc
 :: 2. Changed to gnu99 standard to support snprintf and other C99 features
 :: 3. Added "-D_POSIX_C_SOURCE=200809L" for POSIX functions like strdup
 :: UDP_HEADLESS_BENCH only enables runtime benchmark switches (-bench-headless/-bench-nopresent).
-set CFLAGS=-std=gnu99 -O3 -mcpu=cortex-a53 -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -D_POSIX_C_SOURCE=200809L -DUDP_HEADLESS_BENCH
+set CFLAGS=-std=gnu99 -O3 -mcpu=cortex-a53 -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -D_POSIX_C_SOURCE=200809L -DUDP_HEADLESS_BENCH -pthread
 
 echo Scanning for sources...
 if exist doom_stream del doom_stream
