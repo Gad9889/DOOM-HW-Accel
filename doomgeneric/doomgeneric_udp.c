@@ -51,6 +51,7 @@ static int bench_skip_present_no_client = 0;
 static int bench_force_sw = 0;
 static int bench_force_hw = 0;
 static int bench_skip_client_wait = 0;
+static int bench_native_320 = 1;
 
 static int arg_eq(const char *a, const char *b)
 {
@@ -63,6 +64,11 @@ int DG_ShouldPresent(void)
         return 1;
 
     return client_fd >= 0;
+}
+
+int DG_UseNative320(void)
+{
+    return bench_native_320;
 }
 
 void DG_Init()
@@ -133,6 +139,8 @@ void DG_Init()
 
 void DG_DrawFrame()
 {
+    int stream_w = bench_native_320 ? 320 : DOOMGENERIC_RESX;
+    int stream_h = bench_native_320 ? 200 : DOOMGENERIC_RESY;
     size_t total_pixels;
     size_t total_bytes_out;
     static uint8_t *pack_buffer = NULL;
@@ -149,7 +157,7 @@ void DG_DrawFrame()
 
     // Revert to 24-bit BGR Packing
     // This reduces bandwidth (higher FPS on 100Mbit) and fixes colors.
-    total_pixels = DOOMGENERIC_RESX * DOOMGENERIC_RESY;
+    total_pixels = (size_t)stream_w * (size_t)stream_h;
     total_bytes_out = total_pixels * 3;
 
     if (!pack_buffer)
@@ -272,6 +280,14 @@ int main(int argc, char **argv)
         {
             bench_force_hw = 1;
         }
+        else if (arg_eq(argv[i], "-native320") || arg_eq(argv[i], "-native_320"))
+        {
+            bench_native_320 = 1;
+        }
+        else if (arg_eq(argv[i], "-fullres") || arg_eq(argv[i], "-full_res"))
+        {
+            bench_native_320 = 0;
+        }
     }
 
     Init_Doom_Accel();
@@ -297,6 +313,10 @@ int main(int argc, char **argv)
     printf("BENCH: render mode %s (accel_regs=%p, fallback=%d)\n",
            (accel_regs && !debug_sw_fallback) ? "HW" : "SW",
            (void *)accel_regs, debug_sw_fallback);
+    printf("BENCH: stream mode %s (%dx%d)\n",
+           bench_native_320 ? "native320" : "fullres",
+           bench_native_320 ? 320 : DOOMGENERIC_RESX,
+           bench_native_320 ? 200 : DOOMGENERIC_RESY);
 
     doomgeneric_Create(argc, argv);
 

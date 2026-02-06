@@ -3,9 +3,10 @@ import struct
 import pygame
 import sys
 
-# Doom Resolution
-WIDTH = 640
-HEIGHT = 400
+# Doom stream resolution (Stage 3 native path is 320x200)
+WIDTH = 320
+HEIGHT = 200
+DISPLAY_SCALE = 2
 # 24-bit Color (BGR)
 TOTAL_BYTES = WIDTH * HEIGHT * 3
 
@@ -46,8 +47,8 @@ def recvall(sock, n):
 def main():
     pygame.init()
     
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Doom TCP Stream (24-bit Stable)")
+    screen = pygame.display.set_mode((WIDTH * DISPLAY_SCALE, HEIGHT * DISPLAY_SCALE))
+    pygame.display.set_caption("Doom TCP Stream (Native 320x200)")
     clock = pygame.time.Clock()
 
     print(f"Connecting to {SERVER_IP}:{SERVER_PORT}...")
@@ -84,6 +85,8 @@ def main():
 
             # Render
             doom_surface = pygame.image.frombuffer(frame_data, (WIDTH, HEIGHT), "BGR")
+            if DISPLAY_SCALE != 1:
+                doom_surface = pygame.transform.scale(doom_surface, (WIDTH * DISPLAY_SCALE, HEIGHT * DISPLAY_SCALE))
             screen.blit(doom_surface, (0, 0))
             pygame.display.flip()
             

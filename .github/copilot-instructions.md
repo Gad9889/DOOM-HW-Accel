@@ -304,3 +304,13 @@ Host-side bottleneck debugging and mitigations added in `doomgeneric/doom_accel.
 - Previous behavior re-ran palette conversion for every vertically duplicated row (`fb_scaling` times), which heavily penalized higher scaling factors.
 - New behavior keeps visual output the same but reduces redundant conversion work, especially at `-scaling 5`.
 - `i_video.c:cmap_to_fb()` now uses prepacked palette caches (`rgb565_palette` / `rgba_palette`) and a fast path for 32-bit `fb_scaling=5` to reduce per-pixel arithmetic/loop overhead.
+
+## Stage 3 Baseline (PS bottleneck reduction)
+
+- Stage 3 default runtime stream mode is now **native 320x200** in `doomgeneric_udp`:
+  - New runtime switches:
+    - `-native320` (explicit native mode)
+    - `-fullres` (fallback to legacy full-resolution stream path)
+- `i_video.c` checks backend stream mode and, in native mode, forces `fb_scaling=1` and output resolution to 320x200.
+- This removes 1080p expansion from PS in Stage 3 and keeps frame transport focused on native DOOM resolution.
+- `doom_udp_viewer.py` updated to receive 320x200 stream and scale on PC client side (`DISPLAY_SCALE`).

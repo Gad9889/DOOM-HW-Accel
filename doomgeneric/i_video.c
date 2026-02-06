@@ -241,10 +241,16 @@ void I_InitGraphics(void)
 {
     int i, gfxmodeparm;
     char *mode;
+    int native_320 = 0;
+
+#ifdef UDP_HEADLESS_BENCH
+    extern int DG_UseNative320(void);
+    native_320 = DG_UseNative320();
+#endif
 
     memset(&s_Fb, 0, sizeof(struct FB_ScreenInfo));
-    s_Fb.xres = DOOMGENERIC_RESX;
-    s_Fb.yres = DOOMGENERIC_RESY;
+    s_Fb.xres = native_320 ? SCREENWIDTH : DOOMGENERIC_RESX;
+    s_Fb.yres = native_320 ? SCREENHEIGHT : DOOMGENERIC_RESY;
     s_Fb.xres_virtual = s_Fb.xres;
     s_Fb.yres_virtual = s_Fb.yres;
 
@@ -311,7 +317,12 @@ void I_InitGraphics(void)
     printf("I_InitGraphics: DOOM screen size: w x h: %d x %d\n", SCREENWIDTH, SCREENHEIGHT);
 
     i = M_CheckParmWithArgs("-scaling", 1);
-    if (i > 0)
+    if (native_320)
+    {
+        fb_scaling = 1;
+        printf("I_InitGraphics: Native320 mode active, forcing scaling factor to 1\n");
+    }
+    else if (i > 0)
     {
         i = atoi(myargv[i + 1]);
         fb_scaling = i;
