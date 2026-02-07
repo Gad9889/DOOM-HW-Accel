@@ -204,3 +204,20 @@ DOOM_RASTER_BASE=0xA0010000 DOOM_PRESENT_BASE=0xA0000000 ./doom_stream -iwad DOO
   - `32 bpp fb0`: PL can present directly to active scanout as `XRGB8888` (no CPU copy).
   - `16 bpp fb0`: PL can present directly to active scanout as `RGB565` (no CPU copy).
   - Direct present uses runtime fb0 scanout offset and stride; no fixed physical address lock is required.
+
+///////////////////////////////
+cd /home/xilinx/jupyter_notebooks
+
+# Remove duplicates and hard-set HUD config
+
+sed -i '/^screenblocks/d;/^show_messages/d' .default.cfg
+printf "screenblocks 10\nshow_messages 1\n" >> .default.cfg
+grep -nE '^(screenblocks|show_messages)' .default.cfg
+
+then /////////////////
+
+sudo systemctl stop getty@tty1.service
+sudo systemd-run --unit doom-screen --collect \
+ -p WorkingDirectory=/home/xilinx/jupyter_notebooks \
+ -p TTYPath=/dev/tty1 -p StandardInput=tty -p StandardOutput=journal -p StandardError=journal \
+ /bin/bash -lc 'chvt 1; export DOOM_PL_COMPOSITE=1 DOOM_STAGE5_BRAM_HANDOFF=0; exec ./doom_stream -iwad DOOM1.WAD -screen -bench-hw -pl-scale -fullres -scaling 5 -warp 1 1'
