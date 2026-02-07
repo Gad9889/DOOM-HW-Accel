@@ -104,6 +104,8 @@ typedef struct __attribute__((packed))
 #define REG_PRESENT_LANES 0x84 // 1 or 4
 #define REG_PRESENT_FORMAT 0x8C // 0=XRGB8888, 1=RGB565
 #define REG_PRESENT_STRIDE_BYTES 0x94 // destination stride in bytes (0=packed row)
+#define REG_RCAS_ENABLE 0x9C // 0=off, 1=on
+#define REG_RCAS_STRENGTH 0xA4 // 0..255
 
 // Present output formats
 #define PRESENT_FMT_XRGB8888 0
@@ -204,6 +206,9 @@ void HW_SetPresentOutputFormat(int format);
 int HW_GetPresentOutputFormat(void);
 void HW_SetPresentStrideBytes(uint32_t stride_bytes);
 uint32_t HW_GetPresentStrideBytes(void);
+void HW_SetRCASLite(int enable, uint32_t strength);
+int HW_GetRCASLiteEnabled(void);
+uint32_t HW_GetRCASLiteStrength(void);
 
 // Stage 4.3: multi-lane output control (1 lane or 4 lanes).
 void HW_SetPresentLanes(int lanes);

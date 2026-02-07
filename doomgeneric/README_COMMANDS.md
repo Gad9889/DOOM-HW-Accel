@@ -45,6 +45,12 @@ Force BRAM handoff + PS HUD overlay path:
 ./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -pl-bram -no-client -fullres -scaling 5 -async-present -timedemo demo1
 ```
 
+Enable Stage6 RCAS-lite (strength 96):
+
+```sh
+./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -pl-bram -rcas-lite 96 -no-client -fullres -scaling 5 -async-present -timedemo demo1
+```
+
 ## Screen run (mini-DP)
 
 Run from board shell:
@@ -57,6 +63,12 @@ Screen + timedemo (BRAM handoff + HUD overlay, full-performance path):
 
 ```sh
 ./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -pl-bram -screen -fullres -scaling 5 -async-present -timedemo demo1
+```
+
+Screen + timedemo (BRAM + HUD + RCAS-lite 96):
+
+```sh
+./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -pl-bram -rcas-lite 96 -screen -fullres -scaling 5 -async-present -timedemo demo1
 ```
 
 Screen + timedemo (PL composite path, currently no HUD in this runtime flow):

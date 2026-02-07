@@ -26,6 +26,8 @@ static uint32_t raster_output_phys = PHY_VIDEO_BUF;
 static uint32_t present_output_phys = PHY_FB_ADDR;
 static int present_output_format = PRESENT_FMT_XRGB8888;
 static uint32_t present_stride_bytes = 1600 * 4;
+static int rcas_lite_enabled = 0;
+static uint32_t rcas_lite_strength = 96;
 static uint32_t raster_regs_phys = ACCEL_BASE_ADDR;
 static uint32_t present_regs_phys = ACCEL_PRESENT_BASE_ADDR;
 static int stage5_shared_bram_handoff_enabled = 0;
@@ -127,6 +129,14 @@ static void resolve_ip_reg_bases(void)
     // Composite mode means present reads the final indexed frame from PHY_VIDEO_BUF,
     // so HUD/menu/software overlays are included in PL upscale output.
     pl_composite_enabled = parse_env_bool("DOOM_PL_COMPOSITE", 1);
+    rcas_lite_enabled = parse_env_bool("DOOM_RCAS_LITE", 0);
+    rcas_lite_strength = parse_env_u32("DOOM_RCAS_STRENGTH", 96);
+    if (rcas_lite_strength > 255U)
+    {
+        printf("WARN: DOOM_RCAS_STRENGTH out of range (%u), clamping to 255\n",
+               rcas_lite_strength);
+        rcas_lite_strength = 255U;
+    }
 
     if (raster_regs_phys == present_regs_phys)
     {
@@ -372,6 +382,8 @@ void Init_Doom_Accel(void)
     accel_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
     accel_regs[REG_PRESENT_FORMAT / 4] = (uint32_t)present_output_format;
     accel_regs[REG_PRESENT_STRIDE_BYTES / 4] = present_stride_bytes;
+    accel_regs[REG_RCAS_ENABLE / 4] = (uint32_t)rcas_lite_enabled;
+    accel_regs[REG_RCAS_STRENGTH / 4] = rcas_lite_strength;
 
     // Present IP default pointers:
     // - source indexed frame from PHY_VIDEO_BUF
@@ -396,6 +408,8 @@ void Init_Doom_Accel(void)
         present_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
         present_regs[REG_PRESENT_FORMAT / 4] = (uint32_t)present_output_format;
         present_regs[REG_PRESENT_STRIDE_BYTES / 4] = present_stride_bytes;
+        present_regs[REG_RCAS_ENABLE / 4] = (uint32_t)rcas_lite_enabled;
+        present_regs[REG_RCAS_STRENGTH / 4] = rcas_lite_strength;
     }
 
     // Verify FPGA is responding
@@ -420,6 +434,9 @@ void Init_Doom_Accel(void)
     cmd_count = 0;
     tex_atlas_offset = 0;
 
+    printf("RCAS-lite: %s (strength=%u)\n",
+           rcas_lite_enabled ? "ENABLED" : "DISABLED",
+           rcas_lite_strength);
     printf("=== ACCEL INIT COMPLETE ===\n");
 }
 
@@ -978,6 +995,42 @@ uint32_t HW_GetPresentStrideBytes(void)
     return present_stride_bytes;
 }
 
+void HW_SetRCASLite(int enable, uint32_t strength)
+{
+    rcas_lite_enabled = enable ? 1 : 0;
+    if (strength > 255U)
+    {
+        strength = 255U;
+    }
+    rcas_lite_strength = strength;
+
+    if (accel_regs)
+    {
+        accel_regs[REG_RCAS_ENABLE / 4] = (uint32_t)rcas_lite_enabled;
+        accel_regs[REG_RCAS_STRENGTH / 4] = rcas_lite_strength;
+    }
+    if (present_regs)
+    {
+        present_regs[REG_RCAS_ENABLE / 4] = (uint32_t)rcas_lite_enabled;
+        present_regs[REG_RCAS_STRENGTH / 4] = rcas_lite_strength;
+    }
+    __sync_synchronize();
+
+    printf("RCAS-lite: %s (strength=%u)\n",
+           rcas_lite_enabled ? "ENABLED" : "DISABLED",
+           rcas_lite_strength);
+}
+
+int HW_GetRCASLiteEnabled(void)
+{
+    return rcas_lite_enabled;
+}
+
+uint32_t HW_GetRCASLiteStrength(void)
+{
+    return rcas_lite_strength;
+}
+
 void HW_SetPresentLanes(int lanes)
 {
     (void)lanes;
@@ -1043,6 +1096,8 @@ uint64_t HW_UpscaleFrame(void)
     present_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
     present_regs[REG_PRESENT_FORMAT / 4] = (uint32_t)present_output_format;
     present_regs[REG_PRESENT_STRIDE_BYTES / 4] = present_stride_bytes;
+    present_regs[REG_RCAS_ENABLE / 4] = (uint32_t)rcas_lite_enabled;
+    present_regs[REG_RCAS_STRENGTH / 4] = rcas_lite_strength;
     __sync_synchronize();
 
     // MODE_PRESENT is preferred for split pipeline; monolithic path keeps MODE_UPSCALE compatibility.
@@ -1066,6 +1121,8 @@ uint64_t HW_UpscaleFrame(void)
         accel_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
         accel_regs[REG_PRESENT_FORMAT / 4] = PRESENT_FMT_XRGB8888;
         accel_regs[REG_PRESENT_STRIDE_BYTES / 4] = 1600 * 4;
+        accel_regs[REG_RCAS_ENABLE / 4] = (uint32_t)rcas_lite_enabled;
+        accel_regs[REG_RCAS_STRENGTH / 4] = rcas_lite_strength;
         __sync_synchronize();
     }
     else

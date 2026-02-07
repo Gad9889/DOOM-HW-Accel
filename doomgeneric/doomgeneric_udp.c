@@ -58,6 +58,8 @@ static int bench_force_hw = 0;
 static int bench_skip_client_wait = 0;
 static int bench_native_320 = 1;
 static int bench_pl_scale = 0;
+static int bench_rcas_enable = -1; // -1: keep env/default
+static uint32_t bench_rcas_strength = 96;
 // -1: keep current/env choice, 0: BRAM handoff + PS HUD overlay, 1: PL composite
 static int bench_pl_composite_override = -1;
 static int stream_width = 320;
@@ -108,6 +110,7 @@ static void print_usage(const char *exe)
     printf("  -pl-scale         Enable PL fullres upscale/present path\n");
     printf("  -pl-composite     Force PL composite source path (no PS HUD overlay)\n");
     printf("  -pl-bram          Force BRAM handoff + PS HUD overlay path\n");
+    printf("  -rcas-lite [n]    Enable RCAS-lite in present IP (strength 1..255, default 96)\n");
     printf("  -native320        Stream/output mode 320x200\n");
     printf("  -fullres          Stream/output mode 1600x1000\n");
     printf("  -help, --help     Show this message\n");
@@ -689,6 +692,19 @@ int main(int argc, char **argv)
         {
             bench_pl_composite_override = 0;
         }
+        else if (arg_eq(argv[i], "-rcas-lite"))
+        {
+            bench_rcas_enable = 1;
+            if ((i + 1) < argc && argv[i + 1][0] != '-')
+            {
+                int parsed = atoi(argv[i + 1]);
+                if (parsed > 0)
+                {
+                    bench_rcas_strength = (uint32_t)((parsed > 255) ? 255 : parsed);
+                }
+                i++;
+            }
+        }
         else if (arg_eq(argv[i], "-native320"))
         {
             bench_native_320 = 1;
@@ -769,11 +785,18 @@ int main(int argc, char **argv)
             printf("BENCH: HW+PL BRAM 3D + PS HUD overlay mode\n");
         }
     }
+    if (bench_rcas_enable >= 0)
+    {
+        HW_SetRCASLite(bench_rcas_enable, bench_rcas_strength);
+    }
     HW_SetPresentLanes(4);
     HW_SetPLUpscaleEnabled(bench_pl_scale);
     if (bench_pl_scale)
     {
         printf("BENCH: PL fullres upscale enabled\n");
+        printf("BENCH: RCAS-lite %s (strength=%u)\n",
+               HW_GetRCASLiteEnabled() ? "enabled" : "disabled",
+               HW_GetRCASLiteStrength());
     }
     printf("BENCH: PL output lanes (quad-only fast path): %d\n", HW_GetPresentLanes());
     if (bench_skip_present_no_client)
