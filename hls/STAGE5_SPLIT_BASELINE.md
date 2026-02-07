@@ -38,6 +38,10 @@ If the present IP mapping fails at runtime, software falls back to monolithic be
   - x5 upscale to 1600x1000
   - FB0..FB3 parallel writes
   - no single-lane/native scaling branch in the hot path
+- Present output format/stride controls:
+  - `present_format=0`: XRGB8888 output
+  - `present_format=1`: RGB565 output
+  - `present_stride_bytes`: destination row stride (supports direct fb0 scanout with non-1600 width)
 - Composite runtime behavior (software integration):
   - Default path presents from `PHY_VIDEO_BUF` (full composed indexed frame) so HUD/menu/messages are visible.
   - Shared BRAM handoff can still be tested by setting `DOOM_PL_COMPOSITE=0`.

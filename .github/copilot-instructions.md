@@ -431,8 +431,9 @@ Host-side bottleneck debugging and mitigations added in `doomgeneric/doom_accel.
   - PL upscale can be used with menu/HUD correctness preserved.
 - `-screen` direct present behavior:
   - Runtime reads active `/dev/fb0` scanout offsets and physical base.
-  - If fb0 is 32bpp, PL present output can be redirected to current scanout physical address.
-  - If fb0 is 16bpp (common on PYNQ setups), direct PL present is disabled and CPU copy/convert remains active.
+  - If fb0 is 32bpp, PL present outputs `XRGB8888` directly to scanout.
+  - If fb0 is 16bpp (common on PYNQ setups), PL present outputs `RGB565` directly to scanout.
+  - Present stride is programmed from fb0 runtime stride so non-1600 display widths (eg 2560x1440) are handled without CPU copy.
 
 - Software control changes:
   - New runtime controls in driver:

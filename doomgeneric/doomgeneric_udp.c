@@ -286,6 +286,8 @@ void DG_Init()
 
     if (output_mode == OUTPUT_SCREEN)
     {
+        uint32_t screen_direct_phys = 0;
+
         printf("SCREEN: initializing local framebuffer output on /dev/fb0...\n");
         if (init_screen_output() != 0)
         {
@@ -293,18 +295,26 @@ void DG_Init()
             exit(EXIT_FAILURE);
         }
         screen_pl_direct = 0;
-        if (HW_IsPLUpscaleEnabled() && fb_bytes_per_pixel == 4 && fb_scanout_phys != 0)
+        if (HW_IsPLUpscaleEnabled() && fb_scanout_phys != 0)
         {
-            HW_SetPresentOutputPhys(fb_scanout_phys);
+            screen_direct_phys = fb_scanout_phys + fb_offset_y + fb_offset_x;
+            HW_SetPresentOutputPhys(screen_direct_phys);
+            HW_SetPresentOutputFormat((fb_bytes_per_pixel == 2) ? PRESENT_FMT_RGB565 : PRESENT_FMT_XRGB8888);
+            HW_SetPresentStrideBytes(fb_stride);
             screen_pl_direct = 1;
-            printf("SCREEN: PL direct present enabled (scanout phys=0x%08X)\n", fb_scanout_phys);
+            printf("SCREEN: PL direct present enabled (dst phys=0x%08X, fmt=%s, stride=%u)\n",
+                   screen_direct_phys,
+                   (fb_bytes_per_pixel == 2) ? "RGB565" : "XRGB8888",
+                   fb_stride);
         }
         else
         {
             HW_SetPresentOutputPhys(PHY_FB_ADDR);
+            HW_SetPresentOutputFormat(PRESENT_FMT_XRGB8888);
+            HW_SetPresentStrideBytes(1600 * 4);
             if (HW_IsPLUpscaleEnabled())
             {
-                printf("SCREEN: PL direct present disabled (requires 32bpp fb0 + valid scanout phys)\n");
+                printf("SCREEN: PL direct present disabled (requires valid fb0 scanout phys)\n");
             }
         }
         printf("SCREEN: ready. Output is going to mini-DP via /dev/fb0\n");

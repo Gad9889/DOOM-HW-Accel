@@ -201,5 +201,6 @@ DOOM_RASTER_BASE=0xA0010000 DOOM_PRESENT_BASE=0xA0000000 ./doom_stream -iwad DOO
 - If `-screen` initialization fails, the program exits with an error (no automatic fallback to headless).
 - `-screen` supports `/dev/fb0` in `16 bpp (RGB565)` and `32 bpp`.
 - In `-screen` mode with PL upscale:
-  - `32 bpp fb0`: PL can present directly to active scanout (no CPU copy).
-  - `16 bpp fb0`: CPU copy+convert path is used (PL direct present is disabled).
+  - `32 bpp fb0`: PL can present directly to active scanout as `XRGB8888` (no CPU copy).
+  - `16 bpp fb0`: PL can present directly to active scanout as `RGB565` (no CPU copy).
+  - Direct present uses runtime fb0 scanout offset and stride; no fixed physical address lock is required.

@@ -102,6 +102,12 @@ typedef struct __attribute__((packed))
 #define REG_FB_OUT3_LO 0x78
 #define REG_FB_OUT3_HI 0x7C
 #define REG_PRESENT_LANES 0x84 // 1 or 4
+#define REG_PRESENT_FORMAT 0x8C // 0=XRGB8888, 1=RGB565
+#define REG_PRESENT_STRIDE_BYTES 0x94 // destination stride in bytes (0=packed row)
+
+// Present output formats
+#define PRESENT_FMT_XRGB8888 0
+#define PRESENT_FMT_RGB565 1
 
 // ============================================================================
 // EXTERN GLOBALS
@@ -194,6 +200,10 @@ void HW_SetPLCompositeEnabled(int enable);
 int HW_IsPLCompositeEnabled(void);
 void HW_SetPresentOutputPhys(uint32_t phys_addr);
 uint32_t HW_GetPresentOutputPhys(void);
+void HW_SetPresentOutputFormat(int format);
+int HW_GetPresentOutputFormat(void);
+void HW_SetPresentStrideBytes(uint32_t stride_bytes);
+uint32_t HW_GetPresentStrideBytes(void);
 
 // Stage 4.3: multi-lane output control (1 lane or 4 lanes).
 void HW_SetPresentLanes(int lanes);

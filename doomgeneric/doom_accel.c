@@ -24,6 +24,8 @@ static int present_lanes = 4;
 static int raster_shared_bram_enabled = 0;
 static uint32_t raster_output_phys = PHY_VIDEO_BUF;
 static uint32_t present_output_phys = PHY_FB_ADDR;
+static int present_output_format = PRESENT_FMT_XRGB8888;
+static uint32_t present_stride_bytes = 1600 * 4;
 static uint32_t raster_regs_phys = ACCEL_BASE_ADDR;
 static uint32_t present_regs_phys = ACCEL_PRESENT_BASE_ADDR;
 static int stage5_shared_bram_handoff_enabled = 0;
@@ -356,6 +358,8 @@ void Init_Doom_Accel(void)
     raster_shared_bram_enabled = 0;
     raster_output_phys = PHY_VIDEO_BUF;
     present_output_phys = PHY_FB_ADDR;
+    present_output_format = PRESENT_FMT_XRGB8888;
+    present_stride_bytes = 1600 * 4;
     program_raster_output_ptrs(raster_output_phys);
     accel_regs[REG_TEX_ATLAS_LO / 4] = PHY_TEX_ADDR;
     accel_regs[REG_TEX_ATLAS_HI / 4] = 0;
@@ -366,6 +370,8 @@ void Init_Doom_Accel(void)
     accel_regs[REG_PRESENT_SCALE / 4] = 1;
     accel_regs[REG_PRESENT_ROWS / 4] = 168;
     accel_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
+    accel_regs[REG_PRESENT_FORMAT / 4] = (uint32_t)present_output_format;
+    accel_regs[REG_PRESENT_STRIDE_BYTES / 4] = present_stride_bytes;
 
     // Present IP default pointers:
     // - source indexed frame from PHY_VIDEO_BUF
@@ -388,6 +394,8 @@ void Init_Doom_Accel(void)
         present_regs[REG_PRESENT_SCALE / 4] = 5;
         present_regs[REG_PRESENT_ROWS / 4] = 200;
         present_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
+        present_regs[REG_PRESENT_FORMAT / 4] = (uint32_t)present_output_format;
+        present_regs[REG_PRESENT_STRIDE_BYTES / 4] = present_stride_bytes;
     }
 
     // Verify FPGA is responding
@@ -932,6 +940,44 @@ uint32_t HW_GetPresentOutputPhys(void)
     return present_output_phys;
 }
 
+void HW_SetPresentOutputFormat(int format)
+{
+    int new_format = (format == PRESENT_FMT_RGB565) ? PRESENT_FMT_RGB565 : PRESENT_FMT_XRGB8888;
+    present_output_format = new_format;
+
+    if (!present_regs)
+        return;
+
+    present_regs[REG_PRESENT_FORMAT / 4] = (uint32_t)present_output_format;
+    __sync_synchronize();
+}
+
+int HW_GetPresentOutputFormat(void)
+{
+    return present_output_format;
+}
+
+void HW_SetPresentStrideBytes(uint32_t stride_bytes)
+{
+    if (stride_bytes == 0)
+    {
+        stride_bytes = (present_output_format == PRESENT_FMT_RGB565) ? (1600u * 2u) : (1600u * 4u);
+    }
+
+    present_stride_bytes = stride_bytes;
+
+    if (!present_regs)
+        return;
+
+    present_regs[REG_PRESENT_STRIDE_BYTES / 4] = present_stride_bytes;
+    __sync_synchronize();
+}
+
+uint32_t HW_GetPresentStrideBytes(void)
+{
+    return present_stride_bytes;
+}
+
 void HW_SetPresentLanes(int lanes)
 {
     (void)lanes;
@@ -990,6 +1036,8 @@ uint64_t HW_UpscaleFrame(void)
     present_regs[REG_PRESENT_SCALE / 4] = 5;
     present_regs[REG_PRESENT_ROWS / 4] = 200;
     present_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
+    present_regs[REG_PRESENT_FORMAT / 4] = (uint32_t)present_output_format;
+    present_regs[REG_PRESENT_STRIDE_BYTES / 4] = present_stride_bytes;
     __sync_synchronize();
 
     // MODE_PRESENT is preferred for split pipeline; monolithic path keeps MODE_UPSCALE compatibility.
@@ -1011,6 +1059,8 @@ uint64_t HW_UpscaleFrame(void)
         accel_regs[REG_PRESENT_SCALE / 4] = 1;
         accel_regs[REG_PRESENT_ROWS / 4] = raster_shared_bram_enabled ? 200 : 168;
         accel_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
+        accel_regs[REG_PRESENT_FORMAT / 4] = PRESENT_FMT_XRGB8888;
+        accel_regs[REG_PRESENT_STRIDE_BYTES / 4] = 1600 * 4;
         __sync_synchronize();
     }
     else
