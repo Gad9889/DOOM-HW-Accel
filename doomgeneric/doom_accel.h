@@ -190,6 +190,10 @@ void HW_SetPLUpscaleEnabled(int enable);
 int HW_IsPLUpscaleEnabled(void);
 uint64_t HW_UpscaleFrame(void);
 void HW_SetRasterSharedBRAM(int enable);
+void HW_SetPLCompositeEnabled(int enable);
+int HW_IsPLCompositeEnabled(void);
+void HW_SetPresentOutputPhys(uint32_t phys_addr);
+uint32_t HW_GetPresentOutputPhys(void);
 
 // Stage 4.3: multi-lane output control (1 lane or 4 lanes).
 void HW_SetPresentLanes(int lanes);

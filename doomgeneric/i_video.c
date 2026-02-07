@@ -530,6 +530,7 @@ extern void Reset_Texture_Atlas(void);
 extern void HW_StartFrame(void);
 extern void HW_FinishFrame(void);
 extern int HW_IsPLUpscaleEnabled(void);
+extern int HW_IsPLCompositeEnabled(void);
 extern uint64_t HW_UpscaleFrame(void);
 extern void HW_SetRasterSharedBRAM(int enable);
 extern void Upload_RGBPalette(const uint8_t *palette_rgb, int size);
@@ -554,7 +555,7 @@ void I_StartFrame(void)
     // Stage 5 split path:
     // - Gameplay PL present path: raster writes indexed frame to shared BRAM.
     // - Menu/software path: revert raster output to DDR-backed I_VideoBuffer.
-    if (HW_IsPLUpscaleEnabled() && !menuactive)
+    if (HW_IsPLUpscaleEnabled() && !HW_IsPLCompositeEnabled() && !menuactive)
     {
         HW_SetRasterSharedBRAM(1);
     }
@@ -614,7 +615,8 @@ void I_FinishUpdate(void)
 
     // Stage 4.1 path: PL performs 320x200 -> 1600x1000 upscale in hardware.
     // If menu is open, fall back to PS path for correctness/simplicity.
-    if (HW_IsPLUpscaleEnabled() && !menuactive)
+    if (HW_IsPLUpscaleEnabled() &&
+        (HW_IsPLCompositeEnabled() || !menuactive))
     {
         scale_ns = HW_UpscaleFrame();
         __sync_fetch_and_add(&perf_scale_ns, scale_ns);

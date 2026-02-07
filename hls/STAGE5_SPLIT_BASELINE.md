@@ -28,6 +28,7 @@ Runtime overrides are available without recompiling:
 - `DOOM_PRESENT_BASE` (hex/dec, eg `0xA0000000`)
 - `DOOM_SWAP_IPS=1` (swap defaults quickly if Vivado mapping is flipped)
 - `DOOM_STAGE5_BRAM_HANDOFF=0` (disable raster->present shared BRAM handoff; default is enabled for performance)
+- `DOOM_PL_COMPOSITE=1` (default; present reads composed `PHY_VIDEO_BUF` so HUD/menu are included)
 
 If the present IP mapping fails at runtime, software falls back to monolithic behavior by reusing raster regs.
 
@@ -37,3 +38,6 @@ If the present IP mapping fails at runtime, software falls back to monolithic be
   - x5 upscale to 1600x1000
   - FB0..FB3 parallel writes
   - no single-lane/native scaling branch in the hot path
+- Composite runtime behavior (software integration):
+  - Default path presents from `PHY_VIDEO_BUF` (full composed indexed frame) so HUD/menu/messages are visible.
+  - Shared BRAM handoff can still be tested by setting `DOOM_PL_COMPOSITE=0`.

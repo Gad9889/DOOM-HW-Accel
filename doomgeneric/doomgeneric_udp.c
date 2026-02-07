@@ -78,11 +78,13 @@ static uint32_t fb_bytes_per_pixel = 0;
 static uint32_t fb_scanout_xoffset = 0;
 static uint32_t fb_scanout_yoffset = 0;
 static uint32_t fb_base_offset = 0;
+static uint32_t fb_scanout_phys = 0;
 static uint32_t fb_offset_x = 0;
 static uint32_t fb_offset_y = 0;
 static uint32_t fb_copy_width = 0;
 static uint32_t fb_copy_height = 0;
 static size_t fb_map_size = 0;
+static int screen_pl_direct = 0;
 
 static int arg_eq(const char *a, const char *b)
 {
@@ -158,6 +160,17 @@ static int init_screen_output(void)
     fb_stride = finfo.line_length;
     fb_map_size = (size_t)fb_stride * (size_t)vinfo.yres_virtual;
     fb_base_offset = (fb_scanout_yoffset * fb_stride) + (fb_scanout_xoffset * fb_bytes_per_pixel);
+    {
+        uint64_t scanout_phys64 = (uint64_t)finfo.smem_start + (uint64_t)fb_base_offset;
+        if (scanout_phys64 <= 0xFFFFFFFFULL)
+        {
+            fb_scanout_phys = (uint32_t)scanout_phys64;
+        }
+        else
+        {
+            fb_scanout_phys = 0;
+        }
+    }
 
     if (fb_bytes_per_pixel != 4 && fb_bytes_per_pixel != 2)
     {
@@ -191,6 +204,8 @@ static int init_screen_output(void)
            fb_width, fb_height, vinfo.xres_virtual, vinfo.yres_virtual, vinfo.bits_per_pixel, fb_stride);
     printf("SCREEN: scanout offset x=%u y=%u (base+%u bytes)\n",
            fb_scanout_xoffset, fb_scanout_yoffset, fb_base_offset);
+    printf("SCREEN: fb0 phys base=0x%08lX scanout=0x%08X\n",
+           (unsigned long)finfo.smem_start, fb_scanout_phys);
     printf("SCREEN: centered %dx%d\n", stream_width, stream_height);
     printf("SCREEN: copy area %ux%u\n", fb_copy_width, fb_copy_height);
     if (fb_copy_width != (uint32_t)stream_width || fb_copy_height != (uint32_t)stream_height)
@@ -276,6 +291,21 @@ void DG_Init()
         {
             fprintf(stderr, "ERR: -screen mode requested, but /dev/fb0 init failed. Exiting.\n");
             exit(EXIT_FAILURE);
+        }
+        screen_pl_direct = 0;
+        if (HW_IsPLUpscaleEnabled() && fb_bytes_per_pixel == 4 && fb_scanout_phys != 0)
+        {
+            HW_SetPresentOutputPhys(fb_scanout_phys);
+            screen_pl_direct = 1;
+            printf("SCREEN: PL direct present enabled (scanout phys=0x%08X)\n", fb_scanout_phys);
+        }
+        else
+        {
+            HW_SetPresentOutputPhys(PHY_FB_ADDR);
+            if (HW_IsPLUpscaleEnabled())
+            {
+                printf("SCREEN: PL direct present disabled (requires 32bpp fb0 + valid scanout phys)\n");
+            }
         }
         printf("SCREEN: ready. Output is going to mini-DP via /dev/fb0\n");
         server_fd = -1;
@@ -386,6 +416,12 @@ void DG_DrawFrame()
 
         if (!fb_ptr)
             return;
+
+        if (screen_pl_direct && HW_IsPLUpscaleEnabled())
+        {
+            perf_send_ns += (GetTimeNs() - start_local);
+            return;
+        }
 
         if (fb_bytes_per_pixel == 4)
         {

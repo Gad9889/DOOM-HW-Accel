@@ -19,9 +19,11 @@ DrawCommand *cmd_buffer_virt = NULL;
 uint8_t *tex_atlas_virt = NULL;
 uint8_t *colormap_virt = NULL;
 static int pl_upscale_enabled = 0;
+static int pl_composite_enabled = 1;
 static int present_lanes = 4;
 static int raster_shared_bram_enabled = 0;
 static uint32_t raster_output_phys = PHY_VIDEO_BUF;
+static uint32_t present_output_phys = PHY_FB_ADDR;
 static uint32_t raster_regs_phys = ACCEL_BASE_ADDR;
 static uint32_t present_regs_phys = ACCEL_PRESENT_BASE_ADDR;
 static int stage5_shared_bram_handoff_enabled = 0;
@@ -120,6 +122,9 @@ static void resolve_ip_reg_bases(void)
     present_regs_phys = parse_env_u32("DOOM_PRESENT_BASE", present_default);
     // Default ON for performance; can be disabled with DOOM_STAGE5_BRAM_HANDOFF=0.
     stage5_shared_bram_handoff_enabled = parse_env_bool("DOOM_STAGE5_BRAM_HANDOFF", 1);
+    // Composite mode means present reads the final indexed frame from PHY_VIDEO_BUF,
+    // so HUD/menu/software overlays are included in PL upscale output.
+    pl_composite_enabled = parse_env_bool("DOOM_PL_COMPOSITE", 1);
 
     if (raster_regs_phys == present_regs_phys)
     {
@@ -261,6 +266,8 @@ void Init_Doom_Accel(void)
            raster_regs_phys, present_regs_phys);
     printf("Stage5 BRAM handoff: %s (set DOOM_STAGE5_BRAM_HANDOFF=0 to disable)\n",
            stage5_shared_bram_handoff_enabled ? "ENABLED" : "DISABLED");
+    printf("PL composite mode: %s (set DOOM_PL_COMPOSITE=0 for BRAM handoff source)\n",
+           pl_composite_enabled ? "ENABLED" : "DISABLED");
 
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (fd < 0)
@@ -348,6 +355,7 @@ void Init_Doom_Accel(void)
     // Default route keeps raster output in DDR; runtime can switch to shared BRAM.
     raster_shared_bram_enabled = 0;
     raster_output_phys = PHY_VIDEO_BUF;
+    present_output_phys = PHY_FB_ADDR;
     program_raster_output_ptrs(raster_output_phys);
     accel_regs[REG_TEX_ATLAS_LO / 4] = PHY_TEX_ADDR;
     accel_regs[REG_TEX_ATLAS_HI / 4] = 0;
@@ -364,13 +372,13 @@ void Init_Doom_Accel(void)
     // - destination fullres frame at PHY_FB_ADDR
     if (present_regs && present_regs != accel_regs)
     {
-        present_regs[REG_FB_OUT_LO / 4] = PHY_FB_ADDR;
+        present_regs[REG_FB_OUT_LO / 4] = present_output_phys;
         present_regs[REG_FB_OUT_HI / 4] = 0;
-        present_regs[REG_FB_OUT1_LO / 4] = PHY_FB_ADDR;
+        present_regs[REG_FB_OUT1_LO / 4] = present_output_phys;
         present_regs[REG_FB_OUT1_HI / 4] = 0;
-        present_regs[REG_FB_OUT2_LO / 4] = PHY_FB_ADDR;
+        present_regs[REG_FB_OUT2_LO / 4] = present_output_phys;
         present_regs[REG_FB_OUT2_HI / 4] = 0;
-        present_regs[REG_FB_OUT3_LO / 4] = PHY_FB_ADDR;
+        present_regs[REG_FB_OUT3_LO / 4] = present_output_phys;
         present_regs[REG_FB_OUT3_HI / 4] = 0;
         present_regs[REG_TEX_ATLAS_LO / 4] = PHY_TEX_ADDR;
         present_regs[REG_TEX_ATLAS_HI / 4] = 0;
@@ -810,11 +818,14 @@ void HW_SetPLUpscaleEnabled(int enable)
     }
 
     pl_upscale_enabled = 1;
-    HW_SetRasterSharedBRAM(0);
+    if (pl_composite_enabled)
+    {
+        HW_SetRasterSharedBRAM(0);
+    }
     // Route final output buffer to FPGA-visible fullres DDR region.
     DG_ScreenBuffer = (pixel_t *)shared_mem_virt;
-    printf("PL upscale path: enabled (%dx%d output via FPGA)\n",
-           DOOMGENERIC_RESX, DOOMGENERIC_RESY);
+    printf("PL upscale path: enabled (%dx%d output via FPGA, composite=%s)\n",
+           DOOMGENERIC_RESX, DOOMGENERIC_RESY, pl_composite_enabled ? "on" : "off");
 }
 
 int HW_IsPLUpscaleEnabled(void)
@@ -824,6 +835,11 @@ int HW_IsPLUpscaleEnabled(void)
 
 void HW_SetRasterSharedBRAM(int enable)
 {
+    if (pl_composite_enabled)
+    {
+        enable = 0;
+    }
+
     if (!stage5_shared_bram_handoff_enabled)
     {
         enable = 0;
@@ -864,6 +880,58 @@ void HW_SetRasterSharedBRAM(int enable)
            raster_output_phys);
 }
 
+void HW_SetPLCompositeEnabled(int enable)
+{
+    int new_enable = enable ? 1 : 0;
+    if (pl_composite_enabled == new_enable)
+    {
+        return;
+    }
+
+    pl_composite_enabled = new_enable;
+    if (pl_composite_enabled)
+    {
+        HW_SetRasterSharedBRAM(0);
+    }
+
+    printf("PL composite mode: %s\n", pl_composite_enabled ? "ENABLED" : "DISABLED");
+}
+
+int HW_IsPLCompositeEnabled(void)
+{
+    return pl_composite_enabled;
+}
+
+void HW_SetPresentOutputPhys(uint32_t phys_addr)
+{
+    if (phys_addr == 0)
+    {
+        phys_addr = PHY_FB_ADDR;
+    }
+
+    present_output_phys = phys_addr;
+
+    if (!present_regs)
+    {
+        return;
+    }
+
+    present_regs[REG_FB_OUT_LO / 4] = present_output_phys;
+    present_regs[REG_FB_OUT_HI / 4] = 0;
+    present_regs[REG_FB_OUT1_LO / 4] = present_output_phys;
+    present_regs[REG_FB_OUT1_HI / 4] = 0;
+    present_regs[REG_FB_OUT2_LO / 4] = present_output_phys;
+    present_regs[REG_FB_OUT2_HI / 4] = 0;
+    present_regs[REG_FB_OUT3_LO / 4] = present_output_phys;
+    present_regs[REG_FB_OUT3_HI / 4] = 0;
+    __sync_synchronize();
+}
+
+uint32_t HW_GetPresentOutputPhys(void)
+{
+    return present_output_phys;
+}
+
 void HW_SetPresentLanes(int lanes)
 {
     (void)lanes;
@@ -899,16 +967,23 @@ uint64_t HW_UpscaleFrame(void)
 
     start_ns = get_time_ns();
     monolithic_path = (present_regs == accel_regs);
-    present_src_phys = monolithic_path ? PHY_VIDEO_BUF : raster_output_phys;
+    if (pl_composite_enabled)
+    {
+        present_src_phys = PHY_VIDEO_BUF;
+    }
+    else
+    {
+        present_src_phys = monolithic_path ? PHY_VIDEO_BUF : raster_output_phys;
+    }
 
-    // Present IP uses indexed frame at PHY_VIDEO_BUF and writes fullres output at PHY_FB_ADDR.
-    present_regs[REG_FB_OUT_LO / 4] = PHY_FB_ADDR;
+    // Present IP reads indexed source and writes fullres output to present_output_phys.
+    present_regs[REG_FB_OUT_LO / 4] = present_output_phys;
     present_regs[REG_FB_OUT_HI / 4] = 0;
-    present_regs[REG_FB_OUT1_LO / 4] = PHY_FB_ADDR;
+    present_regs[REG_FB_OUT1_LO / 4] = present_output_phys;
     present_regs[REG_FB_OUT1_HI / 4] = 0;
-    present_regs[REG_FB_OUT2_LO / 4] = PHY_FB_ADDR;
+    present_regs[REG_FB_OUT2_LO / 4] = present_output_phys;
     present_regs[REG_FB_OUT2_HI / 4] = 0;
-    present_regs[REG_FB_OUT3_LO / 4] = PHY_FB_ADDR;
+    present_regs[REG_FB_OUT3_LO / 4] = present_output_phys;
     present_regs[REG_FB_OUT3_HI / 4] = 0;
     present_regs[REG_CMD_BUF_LO / 4] = present_src_phys;
     present_regs[REG_CMD_BUF_HI / 4] = 0;
@@ -934,7 +1009,7 @@ uint64_t HW_UpscaleFrame(void)
         accel_regs[REG_CMD_BUF_LO / 4] = PHY_CMD_BUF;
         accel_regs[REG_CMD_BUF_HI / 4] = 0;
         accel_regs[REG_PRESENT_SCALE / 4] = 1;
-        accel_regs[REG_PRESENT_ROWS / 4] = 200;
+        accel_regs[REG_PRESENT_ROWS / 4] = raster_shared_bram_enabled ? 200 : 168;
         accel_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
         __sync_synchronize();
     }

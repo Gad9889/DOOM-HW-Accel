@@ -418,6 +418,22 @@ Host-side bottleneck debugging and mitigations added in `doomgeneric/doom_accel.
     - `present_lanes=1`: legacy single-lane writes
     - `present_lanes=4`: quad-lane writes (4 x 128-bit writes/cycle target in write loop)
 
+## Stage 5 Composite Present (HUD/Menu Included in PL Path)
+
+- Runtime now supports a **composite present source** for PL upscale:
+  - Present source = `PHY_VIDEO_BUF` (composed indexed frame in DDR)
+  - This includes software overlays (HUD/menu/messages) in the PL output.
+- Composite mode is enabled by default:
+  - `DOOM_PL_COMPOSITE=1` (default)
+  - Set `DOOM_PL_COMPOSITE=0` to allow raster->present shared BRAM source experiments.
+- `i_video.c` behavior:
+  - In composite mode, menu no longer forces PS scaling fallback.
+  - PL upscale can be used with menu/HUD correctness preserved.
+- `-screen` direct present behavior:
+  - Runtime reads active `/dev/fb0` scanout offsets and physical base.
+  - If fb0 is 32bpp, PL present output can be redirected to current scanout physical address.
+  - If fb0 is 16bpp (common on PYNQ setups), direct PL present is disabled and CPU copy/convert remains active.
+
 - Software control changes:
   - New runtime controls in driver:
     - `HW_SetPresentLanes(int)` / `HW_GetPresentLanes()`
