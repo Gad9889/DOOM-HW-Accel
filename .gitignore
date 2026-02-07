@@ -22,3 +22,6 @@ doomgeneric/libdoom.so
 
 # Don't ignore the doomgeneric directory itself
 !doomgeneric/
+
+# Local debug notes/log captures
+monitor.md
