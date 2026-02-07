@@ -92,18 +92,35 @@ static void read_index_row(const uint128_t* row_words, uint8_t* row_buf) {
     }
 }
 
-static void load_present_palette(const uint8_t* colormap_ddr) {
+static void load_present_palette(const uint128_t* colormap_ddr_words) {
     #pragma HLS INLINE off
 
-    const int palette_offset = 32 * 256;
-    const uint8_t* palette_rgb_ddr = colormap_ddr + palette_offset;
+    // Colormap layout in DDR:
+    // - 8KB colormap at byte [0 .. 8191]
+    // - 768B RGB palette at byte [8192 .. 8959]
+    const int palette_word_offset = (32 * 256) / 16; // 8192 / 16 = 512
+    const int palette_words = (256 * 3) / 16;        // 768 / 16 = 48
+    uint8_t palette_rgb[256 * 3];
+    #pragma HLS BIND_STORAGE variable=palette_rgb type=ram_1p impl=bram
 
-    PALETTE_LOAD_LOOP:
+    PALETTE_READ_WORDS:
+    for (int w = 0; w < palette_words; w++) {
+        #pragma HLS PIPELINE II=1
+        uint128_t raw = colormap_ddr_words[palette_word_offset + w];
+
+        PALETTE_UNPACK_WORD:
+        for (int b = 0; b < 16; b++) {
+            #pragma HLS UNROLL
+            palette_rgb[(w * 16) + b] = (uint8_t)raw.range((b * 8) + 7, b * 8);
+        }
+    }
+
+    PALETTE_BUILD_TABLES:
     for (int i = 0; i < 256; i++) {
         #pragma HLS PIPELINE II=1
-        uint8_t r = palette_rgb_ddr[(i * 3) + 0];
-        uint8_t g = palette_rgb_ddr[(i * 3) + 1];
-        uint8_t b = palette_rgb_ddr[(i * 3) + 2];
+        uint8_t r = palette_rgb[(i * 3) + 0];
+        uint8_t g = palette_rgb[(i * 3) + 1];
+        uint8_t b = palette_rgb[(i * 3) + 2];
         present_palette_rgba[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
         present_palette_rgb565[i] = (uint16_t)(((uint16_t)(r & 0xF8) << 8) |
                                                ((uint16_t)(g & 0xFC) << 3) |
@@ -114,7 +131,7 @@ static void load_present_palette(const uint8_t* colormap_ddr) {
 void doom_present(
     uint128_t* framebuffer_out,
     uint64_t texture_atlas,
-    const uint8_t* colormap_ddr,
+    const uint128_t* colormap_ddr,
     const uint128_t* command_buffer,
     uint32_t mode,
     uint32_t num_commands,
@@ -133,7 +150,7 @@ void doom_present(
     #pragma HLS INTERFACE m_axi port=framebuffer_out1 depth=800000 offset=slave bundle=FB1 max_write_burst_length=128
     #pragma HLS INTERFACE m_axi port=framebuffer_out2 depth=800000 offset=slave bundle=FB2 max_write_burst_length=128
     #pragma HLS INTERFACE m_axi port=framebuffer_out3 depth=800000 offset=slave bundle=FB3 max_write_burst_length=128
-    #pragma HLS INTERFACE m_axi port=colormap_ddr depth=8960 offset=slave bundle=CMAP max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=colormap_ddr depth=560 offset=slave bundle=CMAP max_read_burst_length=64
     #pragma HLS INTERFACE m_axi port=command_buffer depth=8000 offset=slave bundle=CMD max_read_burst_length=64
 
     #pragma HLS INTERFACE s_axilite port=framebuffer_out bundle=CTRL
