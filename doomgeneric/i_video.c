@@ -134,6 +134,7 @@ static uint16_t rgb565_palette[256];
 static uint32_t rgba_palette[256];
 
 static volatile uint64_t perf_scale_ns = 0;
+#define HUD_BAND_START_Y 168
 
 #define ASYNC_PRESENT_QUEUE_DEPTH 3
 
@@ -147,6 +148,13 @@ static pthread_t async_present_thread;
 static pthread_mutex_t async_present_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t async_present_cv = PTHREAD_COND_INITIALIZER;
 static uint8_t async_present_queue[ASYNC_PRESENT_QUEUE_DEPTH][SCREENWIDTH * SCREENHEIGHT];
+
+#define HUD_SRC_ROWS (SCREENHEIGHT - HUD_BAND_START_Y)
+#define HUD_SRC_BYTES (SCREENWIDTH * HUD_SRC_ROWS)
+static uint8_t hud_prev_src[HUD_SRC_BYTES];
+static int hud_prev_valid = 0;
+static volatile int hud_overlay_dirty = 1;
+static int hud_overlay_enabled = 1;
 
 static inline uint64_t video_now_ns(void)
 {
@@ -248,7 +256,7 @@ void cmap_to_fb(uint8_t *out, uint8_t *in, int in_pixels)
     I_Error("No idea how to convert %d bpp pixels", s_Fb.bits_per_pixel);
 }
 
-static void I_BlitScaledFrame(const unsigned char *src_frame)
+static void I_BlitScaledRows(const unsigned char *src_frame, int src_y_start, int src_y_end)
 {
     int y;
     int x_offset;
@@ -261,12 +269,19 @@ static void I_BlitScaledFrame(const unsigned char *src_frame)
     row_stride_bytes = s_Fb.xres * (s_Fb.bits_per_pixel / 8);
     scaled_row_bytes = SCREENWIDTH * fb_scaling * (s_Fb.bits_per_pixel / 8);
 
-    line_in = (unsigned char *)src_frame;
-    line_out = (unsigned char *)DG_ScreenBuffer;
+    if (src_y_start < 0)
+        src_y_start = 0;
+    if (src_y_end > SCREENHEIGHT)
+        src_y_end = SCREENHEIGHT;
+    if (src_y_start >= src_y_end)
+        return;
 
-    y = SCREENHEIGHT;
+    line_in = (unsigned char *)src_frame + (src_y_start * SCREENWIDTH);
+    line_out = (unsigned char *)DG_ScreenBuffer + (src_y_start * fb_scaling * row_stride_bytes);
 
-    while (y--)
+    y = src_y_end - src_y_start;
+
+    while (y-- > 0)
     {
         unsigned char *line_out_row0;
         int i;
@@ -302,6 +317,28 @@ static void I_BlitScaledFrame(const unsigned char *src_frame)
         line_out += fb_scaling * row_stride_bytes;
         line_in += SCREENWIDTH;
     }
+}
+
+static void I_BlitScaledFrame(const unsigned char *src_frame)
+{
+    I_BlitScaledRows(src_frame, 0, SCREENHEIGHT);
+}
+
+static void I_BlitScaledHudBand(const unsigned char *src_frame)
+{
+    I_BlitScaledRows(src_frame, HUD_BAND_START_Y, SCREENHEIGHT);
+}
+
+int I_ConsumeHudOverlayDirty(void)
+{
+    int was_dirty = hud_overlay_dirty;
+    hud_overlay_dirty = 0;
+    return was_dirty;
+}
+
+int I_IsHudOverlayEnabled(void)
+{
+    return hud_overlay_enabled;
 }
 
 static void *I_AsyncPresentWorker(void *arg)
@@ -495,6 +532,19 @@ void I_InitGraphics(void)
         async_present_enabled = 0;
     }
 
+    {
+        const char *hud_env = getenv("DOOM_HUD_OVERLAY");
+        if (hud_env && hud_env[0] != '\0')
+        {
+            if (hud_env[0] == '0' || hud_env[0] == 'n' || hud_env[0] == 'N' || hud_env[0] == 'f' || hud_env[0] == 'F')
+            {
+                hud_overlay_enabled = 0;
+                hud_overlay_dirty = 0;
+                printf("I_InitGraphics: HUD overlay disabled (DOOM_HUD_OVERLAY=%s)\n", hud_env);
+            }
+        }
+    }
+
     /* Allocate screen to draw to (skip if already set by hardware init) */
     if (I_VideoBuffer == NULL)
     {
@@ -534,7 +584,6 @@ extern int HW_IsPLCompositeEnabled(void);
 extern uint64_t HW_UpscaleFrame(void);
 extern void HW_SetRasterSharedBRAM(int enable);
 extern void Upload_RGBPalette(const uint8_t *palette_rgb, int size);
-extern boolean menuactive;
 
 void I_StartFrame(void)
 {
@@ -552,10 +601,9 @@ void I_StartFrame(void)
     // Start FPGA batch processing for this frame
     HW_StartFrame();
 
-    // Stage 5 split path:
-    // - Gameplay PL present path: raster writes indexed frame to shared BRAM.
-    // - Menu/software path: revert raster output to DDR-backed I_VideoBuffer.
-    if (HW_IsPLUpscaleEnabled() && !HW_IsPLCompositeEnabled() && !menuactive)
+    // Stage 5 BRAM source path:
+    // In non-composite PL mode, raster writes indexed 3D source to shared BRAM.
+    if (HW_IsPLUpscaleEnabled() && !HW_IsPLCompositeEnabled())
     {
         HW_SetRasterSharedBRAM(1);
     }
@@ -613,12 +661,35 @@ void I_FinishUpdate(void)
         return;
     }
 
-    // Stage 4.1 path: PL performs 320x200 -> 1600x1000 upscale in hardware.
-    // If menu is open, fall back to PS path for correctness/simplicity.
-    if (HW_IsPLUpscaleEnabled() &&
-        (HW_IsPLCompositeEnabled() || !menuactive))
+    // PL fullres upscale/present path.
+    // In non-composite BRAM mode:
+    // - performance path overlays HUD band only (no menu/top-message overlay).
+    if (HW_IsPLUpscaleEnabled())
     {
+        uint64_t overlay_start;
+        const uint8_t *hud_src;
+        int hud_changed;
+
         scale_ns = HW_UpscaleFrame();
+
+        if (!HW_IsPLCompositeEnabled())
+        {
+            if (hud_overlay_enabled)
+            {
+                hud_src = (const uint8_t *)I_VideoBuffer + (HUD_BAND_START_Y * SCREENWIDTH);
+                hud_changed = (!hud_prev_valid) || (memcmp(hud_prev_src, hud_src, HUD_SRC_BYTES) != 0);
+                if (hud_changed)
+                {
+                    memcpy(hud_prev_src, hud_src, HUD_SRC_BYTES);
+                    hud_prev_valid = 1;
+                    overlay_start = video_now_ns();
+                    I_BlitScaledHudBand((unsigned char *)I_VideoBuffer);
+                    scale_ns += (video_now_ns() - overlay_start);
+                    hud_overlay_dirty = 1;
+                }
+            }
+        }
+
         __sync_fetch_and_add(&perf_scale_ns, scale_ns);
         DG_DrawFrame();
         return;

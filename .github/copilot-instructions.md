@@ -609,9 +609,14 @@ Host-side bottleneck debugging and mitigations added in `doomgeneric/doom_accel.
   - `HW_SetRasterSharedBRAM(0)`:
     - Raster output and present source both revert to `PHY_VIDEO_BUF` (DDR).
     - Raster DMA row count is set to `168` (legacy view-only DMA preserving software HUD/menu overlay).
-  - `i_video.c:I_StartFrame()` now toggles this automatically:
-    - gameplay + PL upscale enabled -> shared BRAM on
-    - menu/software path -> DDR fallback on
+- Stage5 benchmark-fast path:
+  - when `-bench-hw -pl-scale` is used, runtime forces:
+    - `PL composite = OFF`
+    - `Raster shared BRAM handoff = ON`
+  - `i_video.c` overlays HUD/menu from PS after PL present:
+    - gameplay: HUD/status band only (low overhead)
+    - menu: full-frame software overlay (correctness path)
+  - `i_video.c` keeps deterministic PL present path for gameplay frames.
   - `DOOM_STAGE5_BRAM_HANDOFF=0` disables BRAM handoff globally at runtime.
 
 - Vivado integration expectation:
@@ -645,3 +650,23 @@ Host-side bottleneck debugging and mitigations added in `doomgeneric/doom_accel.
     - Raster now has one FB write master + CMD/CMAP/TEX reads.
     - Present now has FB0..FB3 writes + CMD/CMAP reads.
   - Driver-side register programming remains valid without immediate offset churn.
+
+## Stage 6.0 BRAM Overlay + Stage 6.1 CAS (Current Direction)
+
+- Immediate objective:
+  - Keep `-bench-hw -pl-scale` on BRAM source path with low overhead HUD/menu correctness.
+
+- BRAM overlay architecture:
+  - Raster IP writes indexed frame to shared BRAM (`PHY_STAGE5_BRAM_BUF`).
+  - Present IP reads from shared BRAM and performs upscale/output.
+  - PS overlays are applied on final output buffer after PL present:
+    - gameplay: HUD/status bar band only (rows 168..199 scaled)
+    - menu: full-frame software overlay path
+  - Composite mode stays OFF in this path.
+
+- Stage 6.1 visual quality path:
+  - Add optional CAS-lite in present IP (post-upscale, before writeout).
+  - Runtime controls:
+    - `cas_enable` (0/1)
+    - `cas_strength` (0..255)
+  - Keep default OFF to preserve baseline perf measurements.

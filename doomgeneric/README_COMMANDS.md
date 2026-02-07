@@ -1,214 +1,109 @@
-# Doom Stream Commands (Canonical)
+# Doom Stage5 Benchmark Commands
 
-This file is the single source of truth for `doom_stream` runtime commands.
+This file documents only the paths used for Stage5 performance comparison.
 
-## Build
+## What matters
 
-From `doomgeneric/` on host:
+- `SW baseline`: `-bench-sw`
+- `HW baseline`: `-bench-hw -pl-scale`
 
-```bat
-build.bat
-```
+When `-bench-hw -pl-scale` is used, runtime uses BRAM overlay mode:
 
-On board (if building there):
+- PL composite source: OFF
+- Raster handoff source: shared BRAM ON
+- Present path: PL upscale/present from BRAM source
+- PS overlay policy:
+  - gameplay: HUD/status band is overlaid by PS on final frame
+  - menu/messages: not overlaid in perf mode (HUD-only path)
+- In `-screen` mode with PL direct present:
+  - composite ON: no PS copy path
+  - composite OFF: only HUD/status band is copied by PS to scanout
 
-```sh
-make -f Makefile.sdl
-```
+## Throughput compare (no client)
 
-## Runtime Flags (doomgeneric_udp.c)
-
-Use only these flags:
-
-- `-tcp-screen` enable TCP viewer mode (default)
-- `-screen` display on local `/dev/fb0` (mini-DP path)
-- `-headless` disable TCP and skip present (pure headless benchmark mode)
-- `-bench-sw` force software path
-- `-bench-hw` force hardware path
-- `-no-client` do not wait for TCP viewer
-- `-bench-headless` skip present when no client is connected
-- `-pl-scale` enable PL fullres upscale/present path
-- `-native320` force 320x200 stream mode
-- `-fullres` force 1600x1000 stream mode
-- `-help` or `--help` print runtime help
-
-DOOM engine flags you will commonly combine with these:
-
-- `-iwad <file>`
-- `-timedemo <demo>`
-- `-scaling <n>`
-- `-async-present`
-
-## Recommended Bench Commands
-
-### 0) Display mode quick switch
-
-TCP screen mode:
+Software path:
 
 ```sh
-./doom_stream -iwad DOOM1.WAD -tcp-screen
+./doom_stream -iwad DOOM1.WAD -bench-sw -no-client -fullres -scaling 5 -async-present -timedemo demo1
 ```
 
-Mini-DP screen mode (local framebuffer):
+Hardware + PL scale path:
 
 ```sh
-./doom_stream -iwad DOOM1.WAD -screen
+./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -no-client -fullres -scaling 5 -async-present -timedemo demo1
 ```
 
-Headless mode:
+Force HLS composite path:
 
 ```sh
-./doom_stream -iwad DOOM1.WAD -headless
+./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -pl-composite -no-client -fullres -scaling 5 -async-present -timedemo demo1
 ```
 
-### 1) Software baseline, timedemo, no client, no present cost
+Force BRAM handoff + PS HUD overlay path:
 
 ```sh
-./doom_stream -iwad DOOM1.WAD -bench-sw -headless -timedemo demo1 -native320
+./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -pl-bram -no-client -fullres -scaling 5 -async-present -timedemo demo1
 ```
 
-### 2) Hardware raster, timedemo, no client, no present cost
+## Screen run (mini-DP)
+
+Run from board shell:
 
 ```sh
-./doom_stream -iwad DOOM1.WAD -bench-hw -headless -timedemo demo1 -native320
+./doom_stream -iwad DOOM1.WAD -screen -bench-hw -pl-scale -fullres -scaling 5 -async-present
 ```
 
-### 3) Software fullres path (PS scaling), timedemo
+Screen + timedemo (BRAM handoff + HUD overlay, full-performance path):
 
 ```sh
-./doom_stream -iwad DOOM1.WAD -bench-sw -no-client -timedemo demo1 -fullres -scaling 5 -async-present
+./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -pl-bram -screen -fullres -scaling 5 -async-present -timedemo demo1
 ```
 
-### 4) Hardware + PL fullres present, timedemo
+Screen + timedemo (PL composite path, currently no HUD in this runtime flow):
 
 ```sh
-./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -no-client -timedemo demo1 -fullres -scaling 5 -async-present
+./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -pl-composite -screen -fullres -scaling 5 -async-present -timedemo demo1
 ```
 
-### 5) Gameplay (not timedemo), hardware path
+If startup prints `SCREEN: PL direct present disabled`, force scanout physical address:
 
 ```sh
-./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -fullres -scaling 5 -async-present
+DOOM_FB_SCANOUT_PHYS=0x<fb0_scanout_phys> ./doom_stream -iwad DOOM1.WAD -screen -bench-hw -pl-scale -fullres -scaling 5 -async-present
 ```
 
-## Viewer Command (PC)
+Disable HUD overlay completely (max perf sanity check):
 
 ```sh
-python doom_udp_viewer.py --ip <board_ip> --port 5000 --scale 0
+DOOM_HUD_OVERLAY=0 ./doom_stream -iwad DOOM1.WAD -screen -bench-hw -pl-scale -fullres -scaling 5 -async-present
 ```
 
-`--scale 0` means auto-scale display window on the PC side.
-
-## systemd Presets (Clean Screen Launch)
-
-Use a templated service so you can switch presets (`screen-hw`, `screen-sw`, `headless-hw`) without changing unit files.
-
-Create preset directory:
+From SSH, launch on tty1:
 
 ```sh
-sudo mkdir -p /etc/doom/presets
-```
-
-Create template unit:
-
-```sh
-sudo tee /etc/systemd/system/doom@.service >/dev/null <<'EOF'
-[Unit]
-Description=Doom preset %i on tty1
-After=multi-user.target
-Conflicts=getty@tty1.service
-
-[Service]
-Type=simple
-WorkingDirectory=/home/xilinx/jupyter_notebooks
-EnvironmentFile=/etc/doom/presets/%i.env
-ExecStart=/bin/bash -lc 'exec /home/xilinx/jupyter_notebooks/doom_stream $DOOM_ARGS'
-TTYPath=/dev/tty1
-StandardInput=tty
-StandardOutput=journal
-StandardError=journal
-Restart=on-failure
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-```
-
-Create preset env files:
-
-```sh
-sudo tee /etc/doom/presets/screen-hw.env >/dev/null <<'EOF'
-DOOM_ARGS='-iwad /home/xilinx/jupyter_notebooks/DOOM1.WAD -screen -bench-hw -pl-scale -fullres -scaling 5 -async-present'
-EOF
-
-sudo tee /etc/doom/presets/screen-sw.env >/dev/null <<'EOF'
-DOOM_ARGS='-iwad /home/xilinx/jupyter_notebooks/DOOM1.WAD -screen -bench-sw -fullres -scaling 5 -sync-present'
-EOF
-
-sudo tee /etc/doom/presets/headless-hw.env >/dev/null <<'EOF'
-DOOM_ARGS='-iwad /home/xilinx/jupyter_notebooks/DOOM1.WAD -headless -bench-hw -pl-scale -fullres -scaling 5 -async-present -timedemo demo1'
-EOF
-```
-
-Reload and start a preset:
-
-```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now doom@screen-hw
-```
-
-Switch preset:
-
-```sh
-sudo systemctl stop doom@screen-hw
-sudo systemctl start doom@headless-hw
+sudo systemctl stop getty@tty1.service
+sudo systemd-run --unit doom-screen --collect \
+  -p WorkingDirectory=/home/xilinx/jupyter_notebooks \
+  -p TTYPath=/dev/tty1 -p StandardInput=tty -p StandardOutput=journal -p StandardError=journal \
+  /bin/bash -lc 'chvt 1; exec ./doom_stream -iwad DOOM1.WAD -screen -bench-hw -pl-scale -fullres -scaling 5 -async-present'
 ```
 
 Logs:
 
 ```sh
-journalctl -fu doom@screen-hw
+journalctl -fu doom-screen
 ```
 
 Stop:
 
 ```sh
-sudo systemctl stop doom@screen-hw
+sudo systemctl stop doom-screen
 ```
 
-## Useful Environment Variables
+## Output mode switches
 
-- `DOOM_RASTER_BASE` raster IP AXI-Lite base (default `0xA0000000`)
-- `DOOM_PRESENT_BASE` present IP AXI-Lite base (default `0xA0010000`)
-- `DOOM_SWAP_IPS=1` swap raster/present base defaults
-- `DOOM_STAGE5_BRAM_HANDOFF=0` disable shared-BRAM handoff (forces DDR handoff)
-- `DOOM_PL_COMPOSITE=1` force PL present source to composed `I_VideoBuffer` (HUD/menu included, default)
-
-Example:
-
-```sh
-DOOM_RASTER_BASE=0xA0010000 DOOM_PRESENT_BASE=0xA0000000 ./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -no-client -timedemo demo1 -fullres -scaling 5 -async-present
-```
-
-## Notes
-
-- If you run without `-timedemo`, game logic/tics can become the limiter.
-- For throughput comparisons, use `-timedemo demo1`.
-- `-bench-headless` is for pure render benchmarking without present/send cost.
-- Legacy underscore/alias forms were removed; use the canonical flags listed above.
-- `-screen` requires writable access to `/dev/fb0` (run as root or with proper group permissions).
-- If `-screen` initialization fails, the program exits with an error (no automatic fallback to headless).
-- `-screen` supports `/dev/fb0` in `16 bpp (RGB565)` and `32 bpp`.
-- In `-screen` mode with PL upscale:
-  - `32 bpp fb0`: PL can present directly to active scanout as `XRGB8888` (no CPU copy).
-  - `16 bpp fb0`: PL can present directly to active scanout as `RGB565` (no CPU copy).
-  - Direct present uses runtime fb0 scanout offset and stride; no fixed physical address lock is required.
-
-///////////////////////////////
-cd /home/xilinx/jupyter_notebooks
-
-# Remove duplicates and hard-set HUD config
+- `-tcp-screen`: TCP viewer mode
+- `-screen`: local mini-DP (`/dev/fb0`)
+- `-headless`: no output/present
 
 sed -i '/^screenblocks/d;/^show_messages/d' .default.cfg
 printf "screenblocks 10\nshow_messages 1\n" >> .default.cfg
@@ -220,4 +115,4 @@ sudo systemctl stop getty@tty1.service
 sudo systemd-run --unit doom-screen --collect \
  -p WorkingDirectory=/home/xilinx/jupyter_notebooks \
  -p TTYPath=/dev/tty1 -p StandardInput=tty -p StandardOutput=journal -p StandardError=journal \
- /bin/bash -lc 'chvt 1; export DOOM_PL_COMPOSITE=1 DOOM_STAGE5_BRAM_HANDOFF=0; exec ./doom_stream -iwad DOOM1.WAD -screen -bench-hw -pl-scale -fullres -scaling 5 -warp 1 1'
+ /bin/bash -lc 'chvt 1; exec ./doom_stream -iwad DOOM1.WAD -bench-hw -pl-scale -screen -fullres -scaling 5 -async-present -timedemo demo1'

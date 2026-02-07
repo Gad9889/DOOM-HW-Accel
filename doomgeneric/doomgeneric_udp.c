@@ -58,6 +58,8 @@ static int bench_force_hw = 0;
 static int bench_skip_client_wait = 0;
 static int bench_native_320 = 1;
 static int bench_pl_scale = 0;
+// -1: keep current/env choice, 0: BRAM handoff + PS HUD overlay, 1: PL composite
+static int bench_pl_composite_override = -1;
 static int stream_width = 320;
 static int stream_height = 200;
 
@@ -104,6 +106,8 @@ static void print_usage(const char *exe)
     printf("  -no-client        Do not open TCP server / wait for viewer\n");
     printf("  -bench-headless   Skip present when no client is connected\n");
     printf("  -pl-scale         Enable PL fullres upscale/present path\n");
+    printf("  -pl-composite     Force PL composite source path (no PS HUD overlay)\n");
+    printf("  -pl-bram          Force BRAM handoff + PS HUD overlay path\n");
     printf("  -native320        Stream/output mode 320x200\n");
     printf("  -fullres          Stream/output mode 1600x1000\n");
     printf("  -help, --help     Show this message\n");
@@ -169,6 +173,24 @@ static int init_screen_output(void)
         else
         {
             fb_scanout_phys = 0;
+        }
+    }
+
+    {
+        const char *scanout_env = getenv("DOOM_FB_SCANOUT_PHYS");
+        if (scanout_env && scanout_env[0] != '\0')
+        {
+            uint64_t forced_phys = strtoull(scanout_env, NULL, 0);
+            if (forced_phys <= 0xFFFFFFFFULL)
+            {
+                fb_scanout_phys = (uint32_t)forced_phys;
+                printf("SCREEN: forcing scanout phys from DOOM_FB_SCANOUT_PHYS=0x%08X\n",
+                       fb_scanout_phys);
+            }
+            else
+            {
+                printf("WARN: DOOM_FB_SCANOUT_PHYS out of 32-bit range, ignoring\n");
+            }
         }
     }
 
@@ -423,20 +445,49 @@ void DG_DrawFrame()
         const uint8_t *src = (const uint8_t *)DG_ScreenBuffer;
         uint8_t *dst = fb_ptr;
         int y;
+        extern int I_ConsumeHudOverlayDirty(void);
+        extern int I_IsHudOverlayEnabled(void);
 
         if (!fb_ptr)
             return;
 
+        int copy_start_y = 0;
+        int copy_end_y = (int)fb_copy_height;
+
         if (screen_pl_direct && HW_IsPLUpscaleEnabled())
         {
-            perf_send_ns += (GetTimeNs() - start_local);
-            return;
+            if (HW_IsPLCompositeEnabled())
+            {
+                // PL already produced final composed frame directly into scanout.
+                perf_send_ns += (GetTimeNs() - start_local);
+                return;
+            }
+
+            // Non-composite BRAM mode:
+            // copy only bottom HUD/status area from DG_ScreenBuffer to scanout.
+            if (!I_IsHudOverlayEnabled())
+            {
+                perf_send_ns += (GetTimeNs() - start_local);
+                return;
+            }
+
+            if (!I_ConsumeHudOverlayDirty())
+            {
+                perf_send_ns += (GetTimeNs() - start_local);
+                return;
+            }
+
+            copy_start_y = ((int)fb_copy_height * 168) / 200;
+            if (copy_start_y < 0)
+                copy_start_y = 0;
+            if (copy_start_y > copy_end_y)
+                copy_start_y = copy_end_y;
         }
 
         if (fb_bytes_per_pixel == 4)
         {
             uint32_t row_bytes = fb_copy_width * 4;
-            for (y = 0; y < (int)fb_copy_height; y++)
+            for (y = copy_start_y; y < copy_end_y; y++)
             {
                 memcpy(dst + fb_base_offset + fb_offset_y + ((uint32_t)y * fb_stride) + fb_offset_x,
                        src + ((uint32_t)y * (uint32_t)stream_width * 4),
@@ -446,7 +497,7 @@ void DG_DrawFrame()
         else if (fb_bytes_per_pixel == 2)
         {
             const uint32_t *src32 = (const uint32_t *)DG_ScreenBuffer;
-            for (y = 0; y < (int)fb_copy_height; y++)
+            for (y = copy_start_y; y < copy_end_y; y++)
             {
                 const uint32_t *src_row = src32 + ((uint32_t)y * (uint32_t)stream_width);
                 uint16_t *dst_row = (uint16_t *)(dst + fb_base_offset + fb_offset_y + ((uint32_t)y * fb_stride) + fb_offset_x);
@@ -630,6 +681,14 @@ int main(int argc, char **argv)
         {
             bench_pl_scale = 1;
         }
+        else if (arg_eq(argv[i], "-pl-composite"))
+        {
+            bench_pl_composite_override = 1;
+        }
+        else if (arg_eq(argv[i], "-pl-bram"))
+        {
+            bench_pl_composite_override = 0;
+        }
         else if (arg_eq(argv[i], "-native320"))
         {
             bench_native_320 = 1;
@@ -688,6 +747,27 @@ int main(int argc, char **argv)
     {
         printf("NOTE: PL upscale requested but stream mode is native320, disabling PL upscale\n");
         bench_pl_scale = 0;
+    }
+    if (bench_force_hw && bench_pl_scale)
+    {
+        int use_composite = (bench_pl_composite_override >= 0)
+                                ? bench_pl_composite_override
+                                : HW_IsPLCompositeEnabled();
+        HW_SetPLCompositeEnabled(use_composite);
+
+        if (use_composite)
+        {
+            HW_SetRasterSharedBRAM(0);
+            printf("BENCH: HW+PL composite mode\n");
+        }
+        else
+        {
+            // Stage 5 benchmark path:
+            // - PL uses BRAM handoff for 3D source.
+            // - PS overlays HUD band only onto final output (see i_video.c).
+            HW_SetRasterSharedBRAM(1);
+            printf("BENCH: HW+PL BRAM 3D + PS HUD overlay mode\n");
+        }
     }
     HW_SetPresentLanes(4);
     HW_SetPLUpscaleEnabled(bench_pl_scale);

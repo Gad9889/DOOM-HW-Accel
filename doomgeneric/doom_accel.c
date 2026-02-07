@@ -1005,6 +1005,7 @@ uint64_t HW_UpscaleFrame(void)
 {
     uint64_t start_ns;
     uint32_t present_src_phys;
+    uint32_t present_rows;
 
     int monolithic_path;
 
@@ -1016,10 +1017,14 @@ uint64_t HW_UpscaleFrame(void)
     if (pl_composite_enabled)
     {
         present_src_phys = PHY_VIDEO_BUF;
+        present_rows = 200;
     }
     else
     {
         present_src_phys = monolithic_path ? PHY_VIDEO_BUF : raster_output_phys;
+        // Non-composite path: PL should only write gameplay rows.
+        // HUD/menu rows are overlaid by PS and must not be clobbered.
+        present_rows = 168;
     }
 
     // Present IP reads indexed source and writes fullres output to present_output_phys.
@@ -1034,7 +1039,7 @@ uint64_t HW_UpscaleFrame(void)
     present_regs[REG_CMD_BUF_LO / 4] = present_src_phys;
     present_regs[REG_CMD_BUF_HI / 4] = 0;
     present_regs[REG_PRESENT_SCALE / 4] = 5;
-    present_regs[REG_PRESENT_ROWS / 4] = 200;
+    present_regs[REG_PRESENT_ROWS / 4] = present_rows;
     present_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
     present_regs[REG_PRESENT_FORMAT / 4] = (uint32_t)present_output_format;
     present_regs[REG_PRESENT_STRIDE_BYTES / 4] = present_stride_bytes;
