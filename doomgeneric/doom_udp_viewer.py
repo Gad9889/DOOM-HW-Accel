@@ -2,16 +2,14 @@ import socket
 import struct
 import pygame
 import sys
+import argparse
 
-# Doom stream resolution (Stage 3 native path is 320x200)
-WIDTH = 320
-HEIGHT = 200
-DISPLAY_SCALE = 2
-# 24-bit Color (BGR)
-TOTAL_BYTES = WIDTH * HEIGHT * 3
+# Stream protocol
+HELLO_MAGIC = b"DGv1"
+HELLO_SIZE = 9
 
 # Network Config
-SERVER_IP = "192.168.3.4" 
+SERVER_IP = "192.168.137.2"
 SERVER_PORT = 5000
 
 KEY_MAP = {
@@ -45,21 +43,47 @@ def recvall(sock, n):
     return data
 
 def main():
-    pygame.init()
-    
-    screen = pygame.display.set_mode((WIDTH * DISPLAY_SCALE, HEIGHT * DISPLAY_SCALE))
-    pygame.display.set_caption("Doom TCP Stream (Native 320x200)")
-    clock = pygame.time.Clock()
+    parser = argparse.ArgumentParser(description="Doom TCP stream viewer")
+    parser.add_argument("--ip", default=SERVER_IP, help="Server IP")
+    parser.add_argument("--port", type=int, default=SERVER_PORT, help="Server port")
+    parser.add_argument("--scale", type=int, default=0, help="Display scale (0=auto)")
+    args = parser.parse_args()
 
-    print(f"Connecting to {SERVER_IP}:{SERVER_PORT}...")
+    pygame.init()
+
+    print(f"Connecting to {args.ip}:{args.port}...")
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((SERVER_IP, SERVER_PORT))
+        sock.connect((args.ip, args.port))
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         print("Connected!")
     except Exception as e:
         print(f"Connection failed: {e}")
         return
+
+    hello = recvall(sock, HELLO_SIZE)
+    if not hello:
+        print("Disconnected before stream hello")
+        return
+
+    if hello[:4] != HELLO_MAGIC:
+        print("Unsupported stream hello from server")
+        return
+
+    width, height = struct.unpack("!HH", hello[4:8])
+    bpp = hello[8]
+    if bpp != 24:
+        print(f"Unsupported stream format: {bpp} bpp")
+        return
+
+    display_scale = args.scale if args.scale > 0 else (2 if width <= 400 else 1)
+    total_bytes = width * height * 3
+
+    screen = pygame.display.set_mode((width * display_scale, height * display_scale))
+    pygame.display.set_caption(f"Doom TCP Stream ({width}x{height}, scale {display_scale}x)")
+    clock = pygame.time.Clock()
+
+    print(f"Stream config: {width}x{height}, {bpp}bpp, display scale {display_scale}x")
 
     running = True
     while running:
@@ -77,16 +101,16 @@ def main():
         
         try:
             # Read 24-bit frame
-            frame_data = recvall(sock, TOTAL_BYTES)
+            frame_data = recvall(sock, total_bytes)
             if not frame_data:
                 print("Disconnected")
                 running = False
                 continue
 
             # Render
-            doom_surface = pygame.image.frombuffer(frame_data, (WIDTH, HEIGHT), "BGR")
-            if DISPLAY_SCALE != 1:
-                doom_surface = pygame.transform.scale(doom_surface, (WIDTH * DISPLAY_SCALE, HEIGHT * DISPLAY_SCALE))
+            doom_surface = pygame.image.frombuffer(frame_data, (width, height), "BGR")
+            if display_scale != 1:
+                doom_surface = pygame.transform.scale(doom_surface, (width * display_scale, height * display_scale))
             screen.blit(doom_surface, (0, 0))
             pygame.display.flip()
             

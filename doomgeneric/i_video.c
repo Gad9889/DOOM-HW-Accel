@@ -486,11 +486,11 @@ void I_InitGraphics(void)
         printf("I_InitGraphics: Auto-scaling factor: %d\n", fb_scaling);
     }
 
-    if (M_CheckParm("-async-present") > 0 || M_CheckParm("-async_present") > 0)
+    if (M_CheckParm("-async-present") > 0)
     {
         async_present_enabled = 1;
     }
-    if (M_CheckParm("-sync-present") > 0 || M_CheckParm("-sync_present") > 0)
+    if (M_CheckParm("-sync-present") > 0)
     {
         async_present_enabled = 0;
     }
@@ -529,6 +529,11 @@ void I_ShutdownGraphics(void)
 extern void Reset_Texture_Atlas(void);
 extern void HW_StartFrame(void);
 extern void HW_FinishFrame(void);
+extern int HW_IsPLUpscaleEnabled(void);
+extern uint64_t HW_UpscaleFrame(void);
+extern void HW_SetRasterSharedBRAM(int enable);
+extern void Upload_RGBPalette(const uint8_t *palette_rgb, int size);
+extern boolean menuactive;
 
 void I_StartFrame(void)
 {
@@ -545,6 +550,18 @@ void I_StartFrame(void)
 
     // Start FPGA batch processing for this frame
     HW_StartFrame();
+
+    // Stage 5 split path:
+    // - Gameplay PL present path: raster writes indexed frame to shared BRAM.
+    // - Menu/software path: revert raster output to DDR-backed I_VideoBuffer.
+    if (HW_IsPLUpscaleEnabled() && !menuactive)
+    {
+        HW_SetRasterSharedBRAM(1);
+    }
+    else
+    {
+        HW_SetRasterSharedBRAM(0);
+    }
 
     // IMPORTANT: Do NOT clear I_VideoBuffer every frame!
     // Original DOOM never clears the framebuffer because:
@@ -591,6 +608,16 @@ void I_FinishUpdate(void)
     // DEBUG: If set, skip the software copy entirely to see FPGA output alone
     if (debug_skip_sw_copy)
     {
+        DG_DrawFrame();
+        return;
+    }
+
+    // Stage 4.1 path: PL performs 320x200 -> 1600x1000 upscale in hardware.
+    // If menu is open, fall back to PS path for correctness/simplicity.
+    if (HW_IsPLUpscaleEnabled() && !menuactive)
+    {
+        scale_ns = HW_UpscaleFrame();
+        __sync_fetch_and_add(&perf_scale_ns, scale_ns);
         DG_DrawFrame();
         return;
     }
@@ -646,6 +673,7 @@ void I_ReadScreen(byte *scr)
 void I_SetPalette(byte *palette)
 {
     int i;
+    uint8_t palette_rgb[256 * 3];
     // col_t* c;
 
     // for (i = 0; i < 256; i++)
@@ -691,7 +719,14 @@ void I_SetPalette(byte *palette)
 #ifdef SYS_BIG_ENDIAN
         rgba_palette[i] = swapLE32(rgba_palette[i]);
 #endif
+
+        palette_rgb[i * 3 + 0] = r;
+        palette_rgb[i * 3 + 1] = g;
+        palette_rgb[i * 3 + 2] = b;
     }
+
+    // Keep PL color expansion palette in sync with current gamma-corrected palette.
+    Upload_RGBPalette(palette_rgb, sizeof(palette_rgb));
 
 #ifdef CMAP256
 

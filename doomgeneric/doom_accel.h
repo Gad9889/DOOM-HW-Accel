@@ -12,15 +12,19 @@
 // ============================================================================
 // MEMORY MAP (Physical Addresses)
 // ============================================================================
-#define ACCEL_BASE_ADDR 0xA0000000 // FPGA Register Interface
+#define ACCEL_BASE_ADDR 0xA0010000 // Raster IP register interface (current split-IP Vivado map)
+#define ACCEL_PRESENT_BASE_ADDR 0xA0000000 // Present IP register interface (current split-IP Vivado map)
 #define ACCEL_SIZE 0x10000
 
 // DDR Shared Memory Layout (32MB total region)
-#define PHY_FB_ADDR 0x70000000    // DG_ScreenBuffer (1920x1080x4 = 8MB)
+#define PHY_FB_ADDR 0x70000000    // DG_ScreenBuffer (1600x1000x4 = 6.4MB, 8MB reserved)
 #define PHY_VIDEO_BUF 0x70800000  // I_VideoBuffer output (320x200 = 64KB)
 #define PHY_CMD_BUF 0x70810000    // Command Buffer (128KB = 4000 cmds x 32B)
 #define PHY_TEX_ADDR 0x70830000   // Texture Atlas (16MB) - Level textures
-#define PHY_CMAP_ADDR 0x71830000  // Colormap (8KB = 32 levels x 256)
+#define PHY_CMAP_ADDR 0x71830000  // Colormap + RGB palette (8KB + 768B)
+// Stage 5 split path: raster->present handoff buffer in PL BRAM via AXI BRAM Controller.
+// Assign this base in Vivado Address Editor for the BRAM controller.
+#define PHY_STAGE5_BRAM_BUF 0xA1000000
 #define MEM_BLOCK_SIZE 0x02000000 // 32MB total mapped region
 
 // ============================================================================
@@ -60,7 +64,10 @@ typedef struct __attribute__((packed))
 #define MODE_CLEAR_FB 2      // Clear framebuffer BRAM to color 0
 #define MODE_DRAW_BATCH 3    // Process all commands from command buffer
 #define MODE_DMA_OUT 4       // DMA framebuffer BRAM -> DDR
+#define MODE_UPSCALE 5       // 320x200 indexed -> 1600x1000 RGBA (Stage 4.1)
 #define MODE_DRAW_AND_DMA 6  // Combined draw + DMA (single handshake)
+#define MODE_PRESENT 7       // BRAM framebuffer -> DDR output (scale 1x/5x)
+#define MODE_DRAW_AND_PRESENT 8 // Draw batch + present in one invocation
 
 // ============================================================================
 // REGISTER OFFSETS (Vitis HLS AXI-Lite CTRL bundle)
@@ -84,11 +91,23 @@ typedef struct __attribute__((packed))
 // Scalar parameters
 #define REG_MODE 0x40         // Mode of operation
 #define REG_NUM_COMMANDS 0x48 // Number of commands to process
+#define REG_PRESENT_SCALE 0x50 // 1 or 5 for present/upscale output
+#define REG_PRESENT_ROWS 0x58  // 1..200 (0 => full height)
+
+// Optional multi-lane framebuffer outputs (Stage 4.3)
+#define REG_FB_OUT1_LO 0x60
+#define REG_FB_OUT1_HI 0x64
+#define REG_FB_OUT2_LO 0x6C
+#define REG_FB_OUT2_HI 0x70
+#define REG_FB_OUT3_LO 0x78
+#define REG_FB_OUT3_HI 0x7C
+#define REG_PRESENT_LANES 0x84 // 1 or 4
 
 // ============================================================================
 // EXTERN GLOBALS
 // ============================================================================
 extern volatile uint32_t *accel_regs;
+extern volatile uint32_t *present_regs;
 extern void *shared_mem_virt;
 extern uint32_t *DG_ScreenBuffer;
 
@@ -135,6 +154,9 @@ void Init_Doom_Accel(void);
 // Upload colormap to DDR and load into FPGA BRAM (call once after WAD load)
 void Upload_Colormap(const uint8_t *colormaps_ptr, int size);
 
+// Upload RGB palette (256x3) used by PL upscale color expansion.
+void Upload_RGBPalette(const uint8_t *palette_rgb, int size);
+
 // Upload texture data to atlas, return offset (call during level load)
 uint32_t Upload_Texture_Data(const uint8_t *source, int size);
 
@@ -162,6 +184,16 @@ void HW_FinishFrame(void);
 
 // Clear the framebuffer BRAM (call at level start, not every frame!)
 void HW_ClearFramebuffer(void);
+
+// Stage 4.1: PL fullres upscale control and execution.
+void HW_SetPLUpscaleEnabled(int enable);
+int HW_IsPLUpscaleEnabled(void);
+uint64_t HW_UpscaleFrame(void);
+void HW_SetRasterSharedBRAM(int enable);
+
+// Stage 4.3: multi-lane output control (1 lane or 4 lanes).
+void HW_SetPresentLanes(int lanes);
+int HW_GetPresentLanes(void);
 
 // Copy current hardware/texture perf counters and reset interval counters.
 void HW_GetAndResetPerfStats(HWPerfStats *out);

@@ -10,6 +10,7 @@
 // GLOBALS
 // ============================================================================
 volatile uint32_t *accel_regs = NULL;
+volatile uint32_t *present_regs = NULL;
 void *shared_mem_virt = NULL;
 
 // Memory region pointers (virtual addresses)
@@ -17,6 +18,13 @@ uint8_t *I_VideoBuffer_shared = NULL;
 DrawCommand *cmd_buffer_virt = NULL;
 uint8_t *tex_atlas_virt = NULL;
 uint8_t *colormap_virt = NULL;
+static int pl_upscale_enabled = 0;
+static int present_lanes = 4;
+static int raster_shared_bram_enabled = 0;
+static uint32_t raster_output_phys = PHY_VIDEO_BUF;
+static uint32_t raster_regs_phys = ACCEL_BASE_ADDR;
+static uint32_t present_regs_phys = ACCEL_PRESENT_BASE_ADDR;
+static int stage5_shared_bram_handoff_enabled = 0;
 
 // Command buffer state
 uint32_t cmd_count = 0;
@@ -44,6 +52,81 @@ static const uint8_t *last_source_ptr = NULL;
 static int last_source_size = 0;
 static uint32_t last_source_offset = 0;
 static HWPerfStats perf_stats = {0};
+
+static uint32_t parse_env_u32(const char *name, uint32_t fallback)
+{
+    const char *value = getenv(name);
+    char *endptr = NULL;
+    unsigned long parsed;
+
+    if (!value || !*value)
+        return fallback;
+
+    parsed = strtoul(value, &endptr, 0);
+    if (endptr == value || (endptr && *endptr != '\0'))
+    {
+        printf("WARN: invalid %s='%s', using 0x%08X\n", name, value, fallback);
+        return fallback;
+    }
+
+    if (parsed > 0xFFFFFFFFUL)
+    {
+        printf("WARN: out-of-range %s='%s', using 0x%08X\n", name, value, fallback);
+        return fallback;
+    }
+
+    return (uint32_t)parsed;
+}
+
+static int parse_env_bool(const char *name, int fallback)
+{
+    const char *value = getenv(name);
+
+    if (!value || !*value)
+        return fallback;
+
+    if (!strcmp(value, "1") || !strcmp(value, "true") || !strcmp(value, "TRUE") ||
+        !strcmp(value, "yes") || !strcmp(value, "YES") || !strcmp(value, "on") || !strcmp(value, "ON"))
+        return 1;
+
+    if (!strcmp(value, "0") || !strcmp(value, "false") || !strcmp(value, "FALSE") ||
+        !strcmp(value, "no") || !strcmp(value, "NO") || !strcmp(value, "off") || !strcmp(value, "OFF"))
+        return 0;
+
+    printf("WARN: invalid %s='%s', using %d\n", name, value, fallback);
+    return fallback;
+}
+
+static void resolve_ip_reg_bases(void)
+{
+    const char *swap_env = getenv("DOOM_SWAP_IPS");
+    int swap = 0;
+    uint32_t raster_default = ACCEL_BASE_ADDR;
+    uint32_t present_default = ACCEL_PRESENT_BASE_ADDR;
+
+    if (swap_env && *swap_env && atoi(swap_env) != 0)
+    {
+        swap = 1;
+    }
+
+    if (swap)
+    {
+        uint32_t tmp = raster_default;
+        raster_default = present_default;
+        present_default = tmp;
+    }
+
+    raster_regs_phys = parse_env_u32("DOOM_RASTER_BASE", raster_default);
+    present_regs_phys = parse_env_u32("DOOM_PRESENT_BASE", present_default);
+    // Default ON for performance; can be disabled with DOOM_STAGE5_BRAM_HANDOFF=0.
+    stage5_shared_bram_handoff_enabled = parse_env_bool("DOOM_STAGE5_BRAM_HANDOFF", 1);
+
+    if (raster_regs_phys == present_regs_phys)
+    {
+        printf("WARN: raster/present register bases are identical (0x%08X)\n",
+               raster_regs_phys);
+    }
+}
 
 static inline uint64_t get_time_ns(void)
 {
@@ -79,58 +162,92 @@ static inline uint32_t tex_ptr_hash(const uint8_t *ptr, int size)
 // Debug flags
 int debug_sw_fallback = 0; // 0 = use FPGA, 1 = software fallback
 
+static inline void program_raster_output_ptrs(uint32_t phys_addr)
+{
+    if (!accel_regs)
+        return;
+
+    accel_regs[REG_FB_OUT_LO / 4] = phys_addr;
+    accel_regs[REG_FB_OUT_HI / 4] = 0;
+    accel_regs[REG_FB_OUT1_LO / 4] = phys_addr;
+    accel_regs[REG_FB_OUT1_HI / 4] = 0;
+    accel_regs[REG_FB_OUT2_LO / 4] = phys_addr;
+    accel_regs[REG_FB_OUT2_HI / 4] = 0;
+    accel_regs[REG_FB_OUT3_LO / 4] = phys_addr;
+    accel_regs[REG_FB_OUT3_HI / 4] = 0;
+}
+
+static inline void program_present_source_ptr(uint32_t phys_addr)
+{
+    if (!present_regs)
+        return;
+
+    present_regs[REG_CMD_BUF_LO / 4] = phys_addr;
+    present_regs[REG_CMD_BUF_HI / 4] = 0;
+}
+
 // ============================================================================
 // HELPER: Wait for FPGA idle
 // ============================================================================
-static inline void wait_fpga_idle(void)
+static inline void wait_fpga_idle_regs(volatile uint32_t *regs, const char *tag)
 {
     int timeout = 100000;
-    while ((accel_regs[REG_CTRL / 4] & 0x4) == 0 && --timeout > 0)
+    while ((regs[REG_CTRL / 4] & 0x4) == 0 && --timeout > 0)
         ;
     if (timeout == 0)
     {
-        printf("WARN: FPGA idle timeout! CTRL=0x%08X\n", accel_regs[REG_CTRL / 4]);
+        printf("WARN: %s idle timeout! CTRL=0x%08X\n", tag, regs[REG_CTRL / 4]);
     }
 }
 
 // ============================================================================
 // HELPER: Wait for FPGA done
 // ============================================================================
-static inline void wait_fpga_done(void)
+static inline void wait_fpga_done_regs(volatile uint32_t *regs, const char *tag)
 {
     int timeout = 1000000; // Longer timeout for batch processing
-    while ((accel_regs[REG_CTRL / 4] & 0x2) == 0 && --timeout > 0)
+    while ((regs[REG_CTRL / 4] & 0x2) == 0 && --timeout > 0)
         ;
     if (timeout == 0)
     {
-        printf("ERR: FPGA done timeout! CTRL=0x%08X\n", accel_regs[REG_CTRL / 4]);
+        printf("ERR: %s done timeout! CTRL=0x%08X\n", tag, regs[REG_CTRL / 4]);
     }
 }
 
 // ============================================================================
 // HELPER: Fire FPGA with mode
 // ============================================================================
-static void fire_fpga(uint32_t mode, uint32_t num_commands)
+static void fire_fpga_regs(volatile uint32_t *regs, uint32_t mode, uint32_t num_commands, const char *tag)
 {
     uint64_t wait_start;
 
     // Ensure FPGA is idle
-    wait_fpga_idle();
+    wait_fpga_idle_regs(regs, tag);
 
     // Set mode and command count
-    accel_regs[REG_MODE / 4] = mode;
-    accel_regs[REG_NUM_COMMANDS / 4] = num_commands;
+    regs[REG_MODE / 4] = mode;
+    regs[REG_NUM_COMMANDS / 4] = num_commands;
 
     // Memory barrier
     __sync_synchronize();
 
     // Fire: Set ap_start
-    accel_regs[REG_CTRL / 4] = 0x1;
+    regs[REG_CTRL / 4] = 0x1;
 
     // Wait for completion
     wait_start = get_time_ns();
-    wait_fpga_done();
+    wait_fpga_done_regs(regs, tag);
     perf_stats.fpga_wait_ns += (get_time_ns() - wait_start);
+}
+
+static void fire_fpga(uint32_t mode, uint32_t num_commands)
+{
+    fire_fpga_regs(accel_regs, mode, num_commands, "raster");
+}
+
+static void fire_present(uint32_t mode)
+{
+    fire_fpga_regs(present_regs, mode, 0, "present");
 }
 
 // ============================================================================
@@ -139,6 +256,11 @@ static void fire_fpga(uint32_t mode, uint32_t num_commands)
 void Init_Doom_Accel(void)
 {
     printf("=== DOOM FPGA Accelerator v2 (Batch Mode) ===\n");
+    resolve_ip_reg_bases();
+    printf("IP register map: raster=0x%08X present=0x%08X\n",
+           raster_regs_phys, present_regs_phys);
+    printf("Stage5 BRAM handoff: %s (set DOOM_STAGE5_BRAM_HANDOFF=0 to disable)\n",
+           stage5_shared_bram_handoff_enabled ? "ENABLED" : "DISABLED");
 
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (fd < 0)
@@ -148,16 +270,28 @@ void Init_Doom_Accel(void)
         return;
     }
 
-    // 1. Map Registers
+    // 1. Map raster registers
     accel_regs = (volatile uint32_t *)mmap(NULL, ACCEL_SIZE,
                                            PROT_READ | PROT_WRITE,
-                                           MAP_SHARED, fd, ACCEL_BASE_ADDR);
+                                           MAP_SHARED, fd, raster_regs_phys);
     if (accel_regs == MAP_FAILED)
     {
-        printf("ERR: Reg mmap failed - running without FPGA\n");
+        printf("ERR: Raster reg mmap failed - running without FPGA\n");
         debug_sw_fallback = 1;
         close(fd);
         return;
+    }
+
+    // 1b. Map present registers (split-IP baseline).
+    // If unavailable, keep monolithic compatibility by reusing accel_regs.
+    present_regs = (volatile uint32_t *)mmap(NULL, ACCEL_SIZE,
+                                             PROT_READ | PROT_WRITE,
+                                             MAP_SHARED, fd, present_regs_phys);
+    if (present_regs == MAP_FAILED)
+    {
+        present_regs = accel_regs;
+        printf("WARN: Present reg mmap failed @0x%08X, using monolithic fallback\n",
+               present_regs_phys);
     }
 
     // 2. Map DDR (entire shared memory region)
@@ -168,6 +302,11 @@ void Init_Doom_Accel(void)
     {
         printf("ERR: DDR mmap failed - running without FPGA\n");
         debug_sw_fallback = 1;
+        if (present_regs && present_regs != accel_regs)
+        {
+            munmap((void *)present_regs, ACCEL_SIZE);
+            present_regs = NULL;
+        }
         munmap((void *)accel_regs, ACCEL_SIZE);
         accel_regs = NULL;
         close(fd);
@@ -195,30 +334,71 @@ void Init_Doom_Accel(void)
     printf("  Command Buffer:  %p (phys 0x%08X)\n", cmd_buffer_virt, PHY_CMD_BUF);
     printf("  Texture Atlas:   %p (phys 0x%08X)\n", tex_atlas_virt, PHY_TEX_ADDR);
     printf("  Colormap:        %p (phys 0x%08X)\n", colormap_virt, PHY_CMAP_ADDR);
+    printf("  Raster regs:     %p (phys 0x%08X)\n", (void *)accel_regs, raster_regs_phys);
+    printf("  Present regs:    %p (phys 0x%08X)%s\n", (void *)present_regs, present_regs_phys,
+           (present_regs == accel_regs) ? " [monolithic fallback]" : "");
     printf("  NOTE: DG_ScreenBuffer stays in cached DDR (malloc) for CPU scaling speed.\n");
 
     // Clear buffers
-    memset(shared_mem_virt, 0, 1920 * 1080 * 4);
+    memset(shared_mem_virt, 0, DOOMGENERIC_RESX * DOOMGENERIC_RESY * sizeof(uint32_t));
     memset(I_VideoBuffer_shared, 0, 320 * 200);
     memset(cmd_buffer_virt, 0, CMD_BUF_SIZE);
 
-    // Setup FPGA pointer addresses (tell AXI masters where memory is)
-    accel_regs[REG_FB_OUT_LO / 4] = PHY_VIDEO_BUF;
-    accel_regs[REG_FB_OUT_HI / 4] = 0;
+    // Setup FPGA pointer addresses (tell AXI masters where memory is).
+    // Default route keeps raster output in DDR; runtime can switch to shared BRAM.
+    raster_shared_bram_enabled = 0;
+    raster_output_phys = PHY_VIDEO_BUF;
+    program_raster_output_ptrs(raster_output_phys);
     accel_regs[REG_TEX_ATLAS_LO / 4] = PHY_TEX_ADDR;
     accel_regs[REG_TEX_ATLAS_HI / 4] = 0;
     accel_regs[REG_CMAP_DDR_LO / 4] = PHY_CMAP_ADDR;
     accel_regs[REG_CMAP_DDR_HI / 4] = 0;
     accel_regs[REG_CMD_BUF_LO / 4] = PHY_CMD_BUF;
     accel_regs[REG_CMD_BUF_HI / 4] = 0;
+    accel_regs[REG_PRESENT_SCALE / 4] = 1;
+    accel_regs[REG_PRESENT_ROWS / 4] = 168;
+    accel_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
+
+    // Present IP default pointers:
+    // - source indexed frame from PHY_VIDEO_BUF
+    // - destination fullres frame at PHY_FB_ADDR
+    if (present_regs && present_regs != accel_regs)
+    {
+        present_regs[REG_FB_OUT_LO / 4] = PHY_FB_ADDR;
+        present_regs[REG_FB_OUT_HI / 4] = 0;
+        present_regs[REG_FB_OUT1_LO / 4] = PHY_FB_ADDR;
+        present_regs[REG_FB_OUT1_HI / 4] = 0;
+        present_regs[REG_FB_OUT2_LO / 4] = PHY_FB_ADDR;
+        present_regs[REG_FB_OUT2_HI / 4] = 0;
+        present_regs[REG_FB_OUT3_LO / 4] = PHY_FB_ADDR;
+        present_regs[REG_FB_OUT3_HI / 4] = 0;
+        present_regs[REG_TEX_ATLAS_LO / 4] = PHY_TEX_ADDR;
+        present_regs[REG_TEX_ATLAS_HI / 4] = 0;
+        present_regs[REG_CMAP_DDR_LO / 4] = PHY_CMAP_ADDR;
+        present_regs[REG_CMAP_DDR_HI / 4] = 0;
+        program_present_source_ptr(raster_output_phys);
+        present_regs[REG_PRESENT_SCALE / 4] = 5;
+        present_regs[REG_PRESENT_ROWS / 4] = 200;
+        present_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
+    }
 
     // Verify FPGA is responding
     uint32_t ctrl_reg = accel_regs[REG_CTRL / 4];
-    printf("FPGA CTRL register = 0x%08X (expect ap_idle=0x4)\n", ctrl_reg);
+    printf("Raster CTRL register = 0x%08X (expect ap_idle=0x4)\n", ctrl_reg);
 
     if ((ctrl_reg & 0x4) == 0)
     {
-        printf("WARNING: FPGA not idle - may not be programmed!\n");
+        printf("WARNING: Raster IP not idle - may not be programmed!\n");
+    }
+
+    if (present_regs && present_regs != accel_regs)
+    {
+        uint32_t pctrl = present_regs[REG_CTRL / 4];
+        printf("Present CTRL register = 0x%08X (expect ap_idle=0x4)\n", pctrl);
+        if ((pctrl & 0x4) == 0)
+        {
+            printf("WARNING: Present IP not idle - check block design clock/reset\n");
+        }
     }
 
     cmd_count = 0;
@@ -246,8 +426,27 @@ void Upload_Colormap(const uint8_t *colormaps_ptr, int size)
     if (accel_regs && !debug_sw_fallback)
     {
         fire_fpga(MODE_LOAD_COLORMAP, 0);
+        if (present_regs && present_regs != accel_regs)
+        {
+            fire_present(MODE_LOAD_COLORMAP);
+        }
         printf("Colormap loaded into FPGA BRAM\n");
     }
+}
+
+void Upload_RGBPalette(const uint8_t *palette_rgb, int size)
+{
+    const int palette_offset = 32 * 256; // right after colormap table
+    int copy_size;
+
+    if (!colormap_virt || !palette_rgb || size <= 0)
+        return;
+
+    copy_size = size;
+    if (copy_size > 256 * 3)
+        copy_size = 256 * 3;
+
+    memcpy(colormap_virt + palette_offset, palette_rgb, copy_size);
 }
 
 // ============================================================================
@@ -589,6 +788,162 @@ void HW_ClearFramebuffer(void)
 
     // Reset texture atlas on level transition (FPGA caches also invalidated)
     Reset_Texture_Atlas();
+}
+
+void HW_SetPLUpscaleEnabled(int enable)
+{
+    extern pixel_t *DG_ScreenBuffer;
+
+    if (!enable)
+    {
+        pl_upscale_enabled = 0;
+        HW_SetRasterSharedBRAM(0);
+        printf("PL upscale path: disabled\n");
+        return;
+    }
+
+    if (debug_sw_fallback || !accel_regs || !present_regs || !shared_mem_virt)
+    {
+        pl_upscale_enabled = 0;
+        printf("WARN: PL upscale requested but FPGA path unavailable\n");
+        return;
+    }
+
+    pl_upscale_enabled = 1;
+    HW_SetRasterSharedBRAM(0);
+    // Route final output buffer to FPGA-visible fullres DDR region.
+    DG_ScreenBuffer = (pixel_t *)shared_mem_virt;
+    printf("PL upscale path: enabled (%dx%d output via FPGA)\n",
+           DOOMGENERIC_RESX, DOOMGENERIC_RESY);
+}
+
+int HW_IsPLUpscaleEnabled(void)
+{
+    return pl_upscale_enabled;
+}
+
+void HW_SetRasterSharedBRAM(int enable)
+{
+    if (!stage5_shared_bram_handoff_enabled)
+    {
+        enable = 0;
+    }
+
+    int can_use_split = (!debug_sw_fallback &&
+                         accel_regs &&
+                         present_regs &&
+                         present_regs != accel_regs);
+    int desired_enable = (enable && can_use_split) ? 1 : 0;
+    uint32_t desired_phys = desired_enable ? PHY_STAGE5_BRAM_BUF : PHY_VIDEO_BUF;
+
+    if (raster_shared_bram_enabled == desired_enable &&
+        raster_output_phys == desired_phys)
+    {
+        return;
+    }
+
+    raster_shared_bram_enabled = desired_enable;
+    raster_output_phys = desired_phys;
+
+    program_raster_output_ptrs(raster_output_phys);
+    if (accel_regs)
+    {
+        // Raster uses this register as DMA row count:
+        // - 168 rows in DDR view-only mode (preserve HUD/menu software overlay)
+        // - 200 rows in shared-BRAM handoff mode (full frame source for present IP)
+        accel_regs[REG_PRESENT_ROWS / 4] = raster_shared_bram_enabled ? 200 : 168;
+    }
+    if (present_regs && present_regs != accel_regs)
+    {
+        program_present_source_ptr(raster_output_phys);
+    }
+    __sync_synchronize();
+
+    printf("Raster->Present handoff: %s (0x%08X)\n",
+           raster_shared_bram_enabled ? "shared BRAM" : "DDR",
+           raster_output_phys);
+}
+
+void HW_SetPresentLanes(int lanes)
+{
+    (void)lanes;
+    present_lanes = 4;
+
+    if (accel_regs)
+    {
+        accel_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
+    }
+    if (present_regs)
+    {
+        present_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
+    }
+    __sync_synchronize();
+
+    printf("PL present lanes: %d (quad-only)\n", present_lanes);
+}
+
+int HW_GetPresentLanes(void)
+{
+    return present_lanes;
+}
+
+uint64_t HW_UpscaleFrame(void)
+{
+    uint64_t start_ns;
+    uint32_t present_src_phys;
+
+    int monolithic_path;
+
+    if (!pl_upscale_enabled || debug_sw_fallback || !present_regs)
+        return 0;
+
+    start_ns = get_time_ns();
+    monolithic_path = (present_regs == accel_regs);
+    present_src_phys = monolithic_path ? PHY_VIDEO_BUF : raster_output_phys;
+
+    // Present IP uses indexed frame at PHY_VIDEO_BUF and writes fullres output at PHY_FB_ADDR.
+    present_regs[REG_FB_OUT_LO / 4] = PHY_FB_ADDR;
+    present_regs[REG_FB_OUT_HI / 4] = 0;
+    present_regs[REG_FB_OUT1_LO / 4] = PHY_FB_ADDR;
+    present_regs[REG_FB_OUT1_HI / 4] = 0;
+    present_regs[REG_FB_OUT2_LO / 4] = PHY_FB_ADDR;
+    present_regs[REG_FB_OUT2_HI / 4] = 0;
+    present_regs[REG_FB_OUT3_LO / 4] = PHY_FB_ADDR;
+    present_regs[REG_FB_OUT3_HI / 4] = 0;
+    present_regs[REG_CMD_BUF_LO / 4] = present_src_phys;
+    present_regs[REG_CMD_BUF_HI / 4] = 0;
+    present_regs[REG_PRESENT_SCALE / 4] = 5;
+    present_regs[REG_PRESENT_ROWS / 4] = 200;
+    present_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
+    __sync_synchronize();
+
+    // MODE_PRESENT is preferred for split pipeline; monolithic path keeps MODE_UPSCALE compatibility.
+    if (monolithic_path)
+    {
+        fire_present(MODE_UPSCALE);
+
+        // Restore monolithic draw-path bindings.
+        accel_regs[REG_FB_OUT_LO / 4] = PHY_VIDEO_BUF;
+        accel_regs[REG_FB_OUT_HI / 4] = 0;
+        accel_regs[REG_FB_OUT1_LO / 4] = PHY_VIDEO_BUF;
+        accel_regs[REG_FB_OUT1_HI / 4] = 0;
+        accel_regs[REG_FB_OUT2_LO / 4] = PHY_VIDEO_BUF;
+        accel_regs[REG_FB_OUT2_HI / 4] = 0;
+        accel_regs[REG_FB_OUT3_LO / 4] = PHY_VIDEO_BUF;
+        accel_regs[REG_FB_OUT3_HI / 4] = 0;
+        accel_regs[REG_CMD_BUF_LO / 4] = PHY_CMD_BUF;
+        accel_regs[REG_CMD_BUF_HI / 4] = 0;
+        accel_regs[REG_PRESENT_SCALE / 4] = 1;
+        accel_regs[REG_PRESENT_ROWS / 4] = 200;
+        accel_regs[REG_PRESENT_LANES / 4] = (uint32_t)present_lanes;
+        __sync_synchronize();
+    }
+    else
+    {
+        fire_present(MODE_PRESENT);
+    }
+
+    return get_time_ns() - start_ns;
 }
 
 void HW_GetAndResetPerfStats(HWPerfStats *out)

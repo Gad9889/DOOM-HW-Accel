@@ -18,6 +18,17 @@
 #define SCREEN_WIDTH  320
 #define SCREEN_HEIGHT 200
 #define FB_SIZE       (SCREEN_WIDTH * SCREEN_HEIGHT) // 64,000 bytes
+#define UPSCALE_FACTOR 5
+#define OUT_WIDTH     (SCREEN_WIDTH * UPSCALE_FACTOR)
+#define OUT_HEIGHT    (SCREEN_HEIGHT * UPSCALE_FACTOR)
+#define OUT_WORDS_PER_ROW (OUT_WIDTH / 4)
+#define PRESENT_LANES_1 1
+#define PRESENT_LANES_4 4
+#define X5_WORDS_PER_LANE (OUT_WORDS_PER_ROW / PRESENT_LANES_4)
+// Stage 5 fast profile:
+// - force fullres x5 present path
+// - force quad-lane write path (FB0..FB3)
+#define STAGE5_FORCE_X5_QUAD 1
 
 // View Window (exclude status bar for DMA)
 #define VIEW_HEIGHT   168
@@ -50,8 +61,10 @@ typedef ap_uint<128> uint128_t;
 #define MODE_CLEAR_FB      2
 #define MODE_DRAW_BATCH    3
 #define MODE_DMA_OUT       4
-#define MODE_UPSCALE       5  // Future: HW bicubic upscale
+#define MODE_UPSCALE       5  // Stage 4.1: 320x200 indexed -> 1600x1000 RGBA
 #define MODE_DRAW_AND_DMA 6  // Combined draw + DMA (single handshake)
+#define MODE_PRESENT      7  // Stage 4.2: BRAM framebuffer -> DDR output (scale 1x/5x)
+#define MODE_DRAW_AND_PRESENT 8 // Stage 4.2: draw batch + present in one invocation
 
 // ============================================================================
 // 2. DATA STRUCTURES
@@ -75,6 +88,7 @@ struct __attribute__((packed)) DrawCommand {
 
 typedef char drawcommand_size_must_be_32[(sizeof(DrawCommand) == 32) ? 1 : -1];
 typedef char drawcommand_tex_offset_must_be_20[(offsetof(DrawCommand, tex_offset) == 20) ? 1 : -1];
+typedef char out_words_per_row_must_divide_4[(OUT_WORDS_PER_ROW % 4 == 0) ? 1 : -1];
 
 // Texture Cache Entry (for LRU tracking)
 struct TexCacheEntry {
@@ -116,6 +130,12 @@ static int line_buffer_base_row;  // Which framebuffer row is in line_buffer[0]
 static uint8_t flat_cache[4096];
 static uint32_t flat_cache_tag;   // tex_offset of cached flat
 static uint8_t flat_cache_valid;  // Cache valid flag
+
+// Stage 4.1 upscale working buffers
+static uint8_t upscale_src_row[SCREEN_WIDTH];
+static uint32_t upscale_src_rgba[SCREEN_WIDTH];
+static uint32_t upscale_palette_rgba[256];
+static uint128_t upscale_row_words[OUT_WORDS_PER_ROW];
 
 // ============================================================================
 // 4. HELPER FUNCTIONS
@@ -223,23 +243,38 @@ void doom_accel(
     const uint8_t* colormap_ddr,       // Colormap in DDR
     const uint128_t* command_buffer,   // Command Buffer in DDR (2 words/cmd)
     uint32_t mode,
-    uint32_t num_commands
+    uint32_t num_commands,
+    uint32_t present_scale,            // MODE_PRESENT/MODE_DRAW_AND_PRESENT: 1 or 5
+    uint32_t present_rows,             // MODE_PRESENT/MODE_DRAW_AND_PRESENT: 1..200 (0 => 200)
+    uint128_t* framebuffer_out1,       // Stage 4.3: optional lane 1 output (same base as framebuffer_out)
+    uint128_t* framebuffer_out2,       // Stage 4.3: optional lane 2 output (same base as framebuffer_out)
+    uint128_t* framebuffer_out3,       // Stage 4.3: optional lane 3 output (same base as framebuffer_out)
+    uint32_t present_lanes             // Stage 4.3: 1 or 4 output lanes
 ) {
     // ------------------------------------------------------------------------
     // INTERFACE PRAGMAS
     // ------------------------------------------------------------------------
-    #pragma HLS INTERFACE m_axi port=framebuffer_out depth=4000 offset=slave bundle=FB max_write_burst_length=128
+    #pragma HLS INTERFACE m_axi port=framebuffer_out depth=400000 offset=slave bundle=FB max_write_burst_length=128
+    #pragma HLS INTERFACE m_axi port=framebuffer_out1 depth=400000 offset=slave bundle=FB1 max_write_burst_length=128
+    #pragma HLS INTERFACE m_axi port=framebuffer_out2 depth=400000 offset=slave bundle=FB2 max_write_burst_length=128
+    #pragma HLS INTERFACE m_axi port=framebuffer_out3 depth=400000 offset=slave bundle=FB3 max_write_burst_length=128
     #pragma HLS INTERFACE m_axi port=texture_atlas depth=1048576 offset=slave bundle=TEX max_read_burst_length=64
-    #pragma HLS INTERFACE m_axi port=colormap_ddr depth=8192 offset=slave bundle=CMAP max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=colormap_ddr depth=8960 offset=slave bundle=CMAP max_read_burst_length=64
     #pragma HLS INTERFACE m_axi port=command_buffer depth=8000 offset=slave bundle=CMD max_read_burst_length=64
 
     // Unified AXI-Lite control
     #pragma HLS INTERFACE s_axilite port=framebuffer_out bundle=CTRL
+    #pragma HLS INTERFACE s_axilite port=framebuffer_out1 bundle=CTRL
+    #pragma HLS INTERFACE s_axilite port=framebuffer_out2 bundle=CTRL
+    #pragma HLS INTERFACE s_axilite port=framebuffer_out3 bundle=CTRL
     #pragma HLS INTERFACE s_axilite port=texture_atlas bundle=CTRL
     #pragma HLS INTERFACE s_axilite port=colormap_ddr bundle=CTRL
     #pragma HLS INTERFACE s_axilite port=command_buffer bundle=CTRL
     #pragma HLS INTERFACE s_axilite port=mode bundle=CTRL
     #pragma HLS INTERFACE s_axilite port=num_commands bundle=CTRL
+    #pragma HLS INTERFACE s_axilite port=present_scale bundle=CTRL
+    #pragma HLS INTERFACE s_axilite port=present_rows bundle=CTRL
+    #pragma HLS INTERFACE s_axilite port=present_lanes bundle=CTRL
     #pragma HLS INTERFACE s_axilite port=return bundle=CTRL
 
     // ------------------------------------------------------------------------
@@ -254,7 +289,12 @@ void doom_accel(
     
     // Array partitioning for parallel access
     #pragma HLS ARRAY_PARTITION variable=line_buffer dim=1 complete
+    #pragma HLS ARRAY_PARTITION variable=upscale_row_words dim=1 block factor=4
     #pragma HLS BIND_STORAGE variable=flat_cache type=ram_2p impl=bram
+    #pragma HLS BIND_STORAGE variable=upscale_src_row type=ram_1p impl=bram
+    #pragma HLS BIND_STORAGE variable=upscale_src_rgba type=ram_2p impl=bram
+    #pragma HLS BIND_STORAGE variable=upscale_palette_rgba type=ram_1p impl=bram
+    #pragma HLS BIND_STORAGE variable=upscale_row_words type=ram_1p impl=bram
 
     // ------------------------------------------------------------------------
     // MODE DISPATCH
@@ -287,7 +327,7 @@ void doom_accel(
     }
 
     // === MODE 3/6: DRAW BATCH (Main Rendering) ===
-    else if (mode == MODE_DRAW_BATCH || mode == MODE_DRAW_AND_DMA) {
+    else if (mode == MODE_DRAW_BATCH || mode == MODE_DRAW_AND_DMA || mode == MODE_DRAW_AND_PRESENT) {
         
         DrawCommand batch[BATCH_SIZE];
         
@@ -409,27 +449,348 @@ void doom_accel(
         }
     }
     
-    // === MODE 5: UPSCALE (Future - Bicubic with Sharpening) ===
+    // === MODE 5: UPSCALE ===
     else if (mode == MODE_UPSCALE) {
-        // Future implementation:
-        // 1. Read row N-1, N, N+1 from framebuffer into line_buffer
-        // 2. Apply 4-tap bicubic vertical filter
-        // 3. Apply horizontal filter  
-        // 4. Apply sharpening kernel
-        // 5. Output to 1080p framebuffer
-        //
-        // For now, this is a placeholder.
-        // The line_buffer is ready for use.
-        
-        // Example: Load 3 consecutive rows
-        // int base_row = 0;
-        // for (int r = 0; r < LINE_BUF_ROWS; r++) {
-        //     for (int x = 0; x < LINE_BUF_WIDTH; x++) {
-        //         #pragma HLS PIPELINE II=1
-        //         line_buffer[r][x] = local_framebuffer[(base_row + r) * SCREEN_WIDTH + x];
-        //     }
-        // }
-        // line_buffer_base_row = base_row;
+        // Input source is a 320x200 indexed frame (passed via command_buffer pointer by PS).
+        // Output is fullres 1600x1000 RGBA (0x00RRGGBB) into framebuffer_out.
+        // RGB palette (256 x 3 bytes) is stored right after colormap in DDR.
+        const int src_words_per_row = SCREEN_WIDTH / 16;
+#if STAGE5_FORCE_X5_QUAD
+        const int use_quad_lanes = 1;
+#else
+        const int use_quad_lanes = (present_lanes >= PRESENT_LANES_4) ? 1 : 0;
+#endif
+        const int palette_offset = 32 * 256;
+        const uint8_t* palette_rgb_ddr = colormap_ddr + palette_offset;
+
+        PALETTE_LOAD_LOOP:
+        for (int i = 0; i < 256; i++) {
+            #pragma HLS PIPELINE II=1
+            uint8_t r = palette_rgb_ddr[(i * 3) + 0];
+            uint8_t g = palette_rgb_ddr[(i * 3) + 1];
+            uint8_t b = palette_rgb_ddr[(i * 3) + 2];
+            upscale_palette_rgba[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+
+        UPSCALE_ROWS:
+        for (int y = 0; y < SCREEN_HEIGHT; y++) {
+            const uint128_t* src_words = command_buffer + (y * src_words_per_row);
+
+            UPSCALE_SRC_READ:
+            for (int w = 0; w < src_words_per_row; w++) {
+                #pragma HLS PIPELINE II=1
+                uint128_t raw = src_words[w];
+
+                UPSCALE_SRC_UNPACK:
+                for (int b = 0; b < 16; b++) {
+                    #pragma HLS UNROLL
+                    upscale_src_row[(w * 16) + b] = (uint8_t)raw.range((b * 8) + 7, b * 8);
+                }
+            }
+
+            // Stage A: indexed -> RGBA for one source row (320 pixels).
+            UPSCALE_INDEX_TO_RGBA:
+            for (int x = 0; x < SCREEN_WIDTH; x++) {
+                #pragma HLS PIPELINE II=1
+                upscale_src_rgba[x] = upscale_palette_rgba[upscale_src_row[x]];
+            }
+
+            // Stage B: pack 1600 RGBA pixels into 400 x 128-bit words.
+            // Output word ow maps to scaled pixel positions [4*ow .. 4*ow+3].
+            // Keep running quotient/remainder for division by 5 to avoid expensive urem/div in hot loop.
+            int q = 0;
+            int r = 0;
+
+            UPSCALE_PACK_ROW_WORDS:
+            for (int ow = 0; ow < OUT_WORDS_PER_ROW; ow++) {
+                #pragma HLS PIPELINE II=1
+                uint32_t c0 = upscale_src_rgba[q];
+                uint32_t c1 = upscale_src_rgba[(q < (SCREEN_WIDTH - 1)) ? (q + 1) : q];
+                uint32_t p0 = c0;
+                uint32_t p1 = c0;
+                uint32_t p2 = c0;
+                uint32_t p3 = c0;
+                uint128_t packed = 0;
+
+                if (r == 2) {
+                    p3 = c1;
+                } else if (r == 3) {
+                    p2 = c1;
+                    p3 = c1;
+                } else if (r == 4) {
+                    p1 = c1;
+                    p2 = c1;
+                    p3 = c1;
+                }
+
+                packed.range(31, 0) = p0;
+                packed.range(63, 32) = p1;
+                packed.range(95, 64) = p2;
+                packed.range(127, 96) = p3;
+                upscale_row_words[ow] = packed;
+
+                r += 4;
+                if (r >= 5) {
+                    r -= 5;
+                    q++;
+                }
+            }
+
+            // Row width is divisible by 4 pixels, no partial word expected.
+            // Duplicate the scaled row vertically by 5x.
+#if STAGE5_FORCE_X5_QUAD
+            UPSCALE_WRITE_ROWS_QUAD:
+            for (int vy = 0; vy < UPSCALE_FACTOR; vy++) {
+                int dst_word_base = ((y * UPSCALE_FACTOR) + vy) * OUT_WORDS_PER_ROW;
+
+                UPSCALE_WRITE_WORDS_QUAD:
+                for (int ow = 0; ow < X5_WORDS_PER_LANE; ow++) {
+                    #pragma HLS PIPELINE II=1
+                    framebuffer_out[dst_word_base + ow] = upscale_row_words[ow];
+                    framebuffer_out1[dst_word_base + X5_WORDS_PER_LANE + ow] = upscale_row_words[X5_WORDS_PER_LANE + ow];
+                    framebuffer_out2[dst_word_base + (2 * X5_WORDS_PER_LANE) + ow] = upscale_row_words[(2 * X5_WORDS_PER_LANE) + ow];
+                    framebuffer_out3[dst_word_base + (3 * X5_WORDS_PER_LANE) + ow] = upscale_row_words[(3 * X5_WORDS_PER_LANE) + ow];
+                }
+            }
+#else
+            if (use_quad_lanes) {
+                UPSCALE_WRITE_ROWS_QUAD:
+                for (int vy = 0; vy < UPSCALE_FACTOR; vy++) {
+                    int dst_word_base = ((y * UPSCALE_FACTOR) + vy) * OUT_WORDS_PER_ROW;
+
+                    UPSCALE_WRITE_WORDS_QUAD:
+                    for (int ow = 0; ow < X5_WORDS_PER_LANE; ow++) {
+                        #pragma HLS PIPELINE II=1
+                        framebuffer_out[dst_word_base + ow] = upscale_row_words[ow];
+                        framebuffer_out1[dst_word_base + X5_WORDS_PER_LANE + ow] = upscale_row_words[X5_WORDS_PER_LANE + ow];
+                        framebuffer_out2[dst_word_base + (2 * X5_WORDS_PER_LANE) + ow] = upscale_row_words[(2 * X5_WORDS_PER_LANE) + ow];
+                        framebuffer_out3[dst_word_base + (3 * X5_WORDS_PER_LANE) + ow] = upscale_row_words[(3 * X5_WORDS_PER_LANE) + ow];
+                    }
+                }
+            } else {
+                UPSCALE_WRITE_ROWS_SINGLE:
+                for (int vy = 0; vy < UPSCALE_FACTOR; vy++) {
+                    int dst_word_base = ((y * UPSCALE_FACTOR) + vy) * OUT_WORDS_PER_ROW;
+
+                    UPSCALE_WRITE_WORDS_SINGLE:
+                    for (int ow = 0; ow < OUT_WORDS_PER_ROW; ow++) {
+                        #pragma HLS PIPELINE II=1
+                        framebuffer_out[dst_word_base + ow] = upscale_row_words[ow];
+                    }
+                }
+            }
+#endif
+        }
+    }
+
+    // === MODE 7/8: PRESENT FROM BRAM FRAMEBUFFER ===
+    else if (mode == MODE_PRESENT || mode == MODE_DRAW_AND_PRESENT) {
+        // Present source is local_framebuffer in BRAM (avoids readback from DDR).
+        // This supports:
+        // - scale 1: native 320x200 RGBA output
+        // - scale 5: 1600x1000 RGBA output
+        int src_rows = (present_rows == 0 || present_rows > SCREEN_HEIGHT)
+                           ? SCREEN_HEIGHT
+                           : (int)present_rows;
+#if STAGE5_FORCE_X5_QUAD
+        int scale5 = 1;
+        int use_quad_lanes = 1;
+#else
+        int scale5 = (present_scale == UPSCALE_FACTOR) ? 1 : 0;
+        int use_quad_lanes = (present_lanes >= PRESENT_LANES_4) ? 1 : 0;
+#endif
+        const int palette_offset = 32 * 256;
+        const uint8_t* palette_rgb_ddr = colormap_ddr + palette_offset;
+
+        PALETTE_LOAD_PRESENT_LOOP:
+        for (int i = 0; i < 256; i++) {
+            #pragma HLS PIPELINE II=1
+            uint8_t r = palette_rgb_ddr[(i * 3) + 0];
+            uint8_t g = palette_rgb_ddr[(i * 3) + 1];
+            uint8_t b = palette_rgb_ddr[(i * 3) + 2];
+            upscale_palette_rgba[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+
+#if STAGE5_FORCE_X5_QUAD
+        PRESENT_ROWS_X5:
+        for (int y = 0; y < src_rows; y++) {
+            int src_row_base = y * SCREEN_WIDTH;
+
+            // Stage A: indexed -> RGBA for one source row (320 pixels).
+            PRESENT_INDEX_TO_RGBA_X5:
+            for (int x = 0; x < SCREEN_WIDTH; x++) {
+                #pragma HLS PIPELINE II=1
+                upscale_src_rgba[x] = upscale_palette_rgba[local_framebuffer[src_row_base + x]];
+            }
+
+            // Stage B: pack 1600 RGBA pixels into 400 x 128-bit words.
+            int q = 0;
+            int r = 0;
+
+            PRESENT_PACK_ROW_WORDS_X5:
+            for (int ow = 0; ow < OUT_WORDS_PER_ROW; ow++) {
+                #pragma HLS PIPELINE II=1
+                uint32_t c0 = upscale_src_rgba[q];
+                uint32_t c1 = upscale_src_rgba[(q < (SCREEN_WIDTH - 1)) ? (q + 1) : q];
+                uint32_t p0 = c0;
+                uint32_t p1 = c0;
+                uint32_t p2 = c0;
+                uint32_t p3 = c0;
+                uint128_t packed = 0;
+
+                if (r == 2) {
+                    p3 = c1;
+                } else if (r == 3) {
+                    p2 = c1;
+                    p3 = c1;
+                } else if (r == 4) {
+                    p1 = c1;
+                    p2 = c1;
+                    p3 = c1;
+                }
+
+                packed.range(31, 0) = p0;
+                packed.range(63, 32) = p1;
+                packed.range(95, 64) = p2;
+                packed.range(127, 96) = p3;
+                upscale_row_words[ow] = packed;
+
+                r += 4;
+                if (r >= 5) {
+                    r -= 5;
+                    q++;
+                }
+            }
+
+            PRESENT_WRITE_ROWS_X5_QUAD:
+            for (int vy = 0; vy < UPSCALE_FACTOR; vy++) {
+                int dst_word_base = ((y * UPSCALE_FACTOR) + vy) * OUT_WORDS_PER_ROW;
+
+                PRESENT_WRITE_WORDS_X5_QUAD:
+                for (int ow = 0; ow < X5_WORDS_PER_LANE; ow++) {
+                    #pragma HLS PIPELINE II=1
+                    framebuffer_out[dst_word_base + ow] = upscale_row_words[ow];
+                    framebuffer_out1[dst_word_base + X5_WORDS_PER_LANE + ow] = upscale_row_words[X5_WORDS_PER_LANE + ow];
+                    framebuffer_out2[dst_word_base + (2 * X5_WORDS_PER_LANE) + ow] = upscale_row_words[(2 * X5_WORDS_PER_LANE) + ow];
+                    framebuffer_out3[dst_word_base + (3 * X5_WORDS_PER_LANE) + ow] = upscale_row_words[(3 * X5_WORDS_PER_LANE) + ow];
+                }
+            }
+        }
+#else
+        if (!scale5) {
+            const int out_words_per_row_native = SCREEN_WIDTH / 4;
+
+            PRESENT_ROWS_NATIVE:
+            for (int y = 0; y < src_rows; y++) {
+                int out_word_idx = 0;
+                int lane = 0;
+                uint128_t packed = 0;
+                int src_row_base = y * SCREEN_WIDTH;
+
+                PRESENT_EXPAND_NATIVE:
+                for (int x = 0; x < SCREEN_WIDTH; x++) {
+                    #pragma HLS PIPELINE II=1
+                    uint8_t src_idx = local_framebuffer[src_row_base + x];
+                    uint32_t rgba = upscale_palette_rgba[src_idx];
+                    packed.range((lane * 32) + 31, lane * 32) = rgba;
+                    lane++;
+                    if (lane == 4) {
+                        upscale_row_words[out_word_idx++] = packed;
+                        packed = 0;
+                        lane = 0;
+                    }
+                }
+
+                {
+                    int dst_word_base = y * out_words_per_row_native;
+
+                    PRESENT_WRITE_NATIVE:
+                    for (int ow = 0; ow < out_words_per_row_native; ow++) {
+                        #pragma HLS PIPELINE II=1
+                        framebuffer_out[dst_word_base + ow] = upscale_row_words[ow];
+                    }
+                }
+            }
+        } else {
+            PRESENT_ROWS_X5:
+            for (int y = 0; y < src_rows; y++) {
+                int src_row_base = y * SCREEN_WIDTH;
+
+                // Stage A: indexed -> RGBA for one source row (320 pixels).
+                PRESENT_INDEX_TO_RGBA_X5:
+                for (int x = 0; x < SCREEN_WIDTH; x++) {
+                    #pragma HLS PIPELINE II=1
+                    upscale_src_rgba[x] = upscale_palette_rgba[local_framebuffer[src_row_base + x]];
+                }
+
+                // Stage B: pack 1600 RGBA pixels into 400 x 128-bit words.
+                int q = 0;
+                int r = 0;
+
+                PRESENT_PACK_ROW_WORDS_X5:
+                for (int ow = 0; ow < OUT_WORDS_PER_ROW; ow++) {
+                    #pragma HLS PIPELINE II=1
+                    uint32_t c0 = upscale_src_rgba[q];
+                    uint32_t c1 = upscale_src_rgba[(q < (SCREEN_WIDTH - 1)) ? (q + 1) : q];
+                    uint32_t p0 = c0;
+                    uint32_t p1 = c0;
+                    uint32_t p2 = c0;
+                    uint32_t p3 = c0;
+                    uint128_t packed = 0;
+
+                    if (r == 2) {
+                        p3 = c1;
+                    } else if (r == 3) {
+                        p2 = c1;
+                        p3 = c1;
+                    } else if (r == 4) {
+                        p1 = c1;
+                        p2 = c1;
+                        p3 = c1;
+                    }
+
+                    packed.range(31, 0) = p0;
+                    packed.range(63, 32) = p1;
+                    packed.range(95, 64) = p2;
+                    packed.range(127, 96) = p3;
+                    upscale_row_words[ow] = packed;
+
+                    r += 4;
+                    if (r >= 5) {
+                        r -= 5;
+                        q++;
+                    }
+                }
+
+                if (use_quad_lanes) {
+                    PRESENT_WRITE_ROWS_X5_QUAD:
+                    for (int vy = 0; vy < UPSCALE_FACTOR; vy++) {
+                        int dst_word_base = ((y * UPSCALE_FACTOR) + vy) * OUT_WORDS_PER_ROW;
+
+                        PRESENT_WRITE_WORDS_X5_QUAD:
+                        for (int ow = 0; ow < X5_WORDS_PER_LANE; ow++) {
+                            #pragma HLS PIPELINE II=1
+                            framebuffer_out[dst_word_base + ow] = upscale_row_words[ow];
+                            framebuffer_out1[dst_word_base + X5_WORDS_PER_LANE + ow] = upscale_row_words[X5_WORDS_PER_LANE + ow];
+                            framebuffer_out2[dst_word_base + (2 * X5_WORDS_PER_LANE) + ow] = upscale_row_words[(2 * X5_WORDS_PER_LANE) + ow];
+                            framebuffer_out3[dst_word_base + (3 * X5_WORDS_PER_LANE) + ow] = upscale_row_words[(3 * X5_WORDS_PER_LANE) + ow];
+                        }
+                    }
+                } else {
+                    PRESENT_WRITE_ROWS_X5_SINGLE:
+                    for (int vy = 0; vy < UPSCALE_FACTOR; vy++) {
+                        int dst_word_base = ((y * UPSCALE_FACTOR) + vy) * OUT_WORDS_PER_ROW;
+
+                        PRESENT_WRITE_WORDS_X5_SINGLE:
+                        for (int ow = 0; ow < OUT_WORDS_PER_ROW; ow++) {
+                            #pragma HLS PIPELINE II=1
+                            framebuffer_out[dst_word_base + ow] = upscale_row_words[ow];
+                        }
+                    }
+                }
+            }
+        }
+#endif
     }
 }
 
